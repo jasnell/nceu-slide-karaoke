@@ -63,55 +63,58 @@ const DECK_TTL = 60 * 60 * 24 * 7; // 7 days
 
 const BASE_PROMPT = `You generate slide decks for Slide Karaoke — a party game at a tech conference where a player must stand on stage and improvise a five-minute talk using slides they have NEVER seen before. The audience is watching. There is no escape.
 
-Your sole purpose is to make the presenter's life as hilariously difficult as possible. The slides must look superficially like a real conference talk but be ABSOLUTE NONSENSE underneath.
+NARRATIVE ARC — THIS IS THE MOST IMPORTANT RULE:
+Every deck MUST tell a story. The slides should flow from one to the next like a real presentation — with an introduction, a build-up, supporting points, and a conclusion. The presenter should be able to look at slide N and understand how it connects to slide N-1, even if the connection is absurd. Think of it as a real talk that took a wrong turn, NOT a random word generator.
+
+Good example: "Why Cats Are the Future of DevOps" → intro → "The Problem with Current Deployment Pipelines" → "What Cats Already Know" → "Case Study: Mr. Whiskers, Senior SRE" → chart showing cat nap hours vs uptime → conclusion
+Bad example: "Banana" → "Concrete" → "The Moon" → "Spreadsheets" (no connection between slides)
+
+The humor comes from the CONTENT being absurd while the STRUCTURE feels like a real talk. Each slide should feel like the logical next step in a presentation that happens to be insane.
 
 Strictly safe for work. No innuendo, nothing political, nothing mean-spirited.
 
-CREATIVITY — CRITICAL:
-You will receive a "chaos seed" with each request containing random words. Use these words as creative fuel — weave them into your titles, themes, and tangents. This ensures every deck is wildly different.
+CREATIVITY:
+You will receive a "chaos seed" with random words. Use 1-2 of them as subtle flavor — sprinkle them in, don't build the whole deck around them. The deck's theme should come from the user's topic, twisted in an unexpected direction.
 
-EVERY DECK MUST BE UNIQUE. Never reuse the same absurd nouns, adjectives, or themes across decks. The universe of absurdity is infinite — draw from ALL of it:
-- Animals, foods, professions, hobbies, historical events, geography, furniture, weather, emotions, textures, sounds, smells, scientific concepts, musical instruments, sports, fabrics, minerals, kitchen appliances, maritime terminology, botanical terms, architectural styles, dance moves...
-- The absurdity should come from UNEXPECTED COMBINATIONS, not from a fixed list of "funny words"
+SLIDE PATTERNS (use 2-3 of these per deck, not all):
+- A fabricated statistic delivered as gospel
+- Corporate jargon mashed with an unrelated domain
+- A title that sounds like a chapter from a book that should not exist
+- A countdown or "phase" that implies a terrifying plan
+- A single ominous word with a period
 
-SLIDE STRUCTURE PATTERNS (vary which you use — never use all in one deck):
-- A single ominous word with a period. Pick something nobody expects.
-- A fabricated statistic delivered as gospel. Invent a new one every time.
-- A non-sequitur audience participation moment. Different every time.
-- Corporate jargon mashed with an unrelated domain.
-- A title that sounds like a chapter from a book that should not exist.
-- A countdown or "phase" that implies a terrifying plan.
-- A title that is a complete sentence but makes no sense.
+CHART SLIDES: When a difficulty level says to include chart slides, you MUST set "chartData" to an array like [{"label":"Cats","value":47},{"label":"Regret","value":83}]. Use 3-6 data points with absurd labels and made-up values. When chartData is null, there is no chart. The chart should relate to the slide's theme within the talk — it's a fake data visualization supporting the absurd argument.
 
-CHART SLIDES — IMPORTANT: When a difficulty level says to include chart slides, you MUST set the "chartData" field to an array of objects like [{"label":"Cats","value":47},{"label":"Regret","value":83}]. Use 3-6 data points with absurd labels and made-up values. Labels should be funny and unexpected. Values can be any number. When chartData is null, there is no chart. When chartData is an array, a bar chart will be rendered on screen — this is the main visual for that slide.
+AUDIENCE PARTICIPATION SLIDES: Set "audience" to true. The slide title becomes a big centered call-to-action that relates to the talk's theme (e.g., "Raise your hand if your deployment pipeline has ever meowed"). Keep chartData null and quote empty on audience slides.
 
-AUDIENCE PARTICIPATION SLIDES: When specified, set "audience" to true. The slide title becomes a big centered call-to-action (e.g., "Everyone stand up if you've ever debugged in production"). Keep chartData null on audience slides. Keep quote empty on audience slides.
+MUTUAL EXCLUSION: Each slide can have a quote OR chartData OR audience, NEVER more than one.
 
-MUTUAL EXCLUSION: Each slide is ONE type only. A slide can have a quote OR chartData OR audience, NEVER more than one. Normal slides have all three empty/null/false.
+FAKE QUOTES: Use ONLY people from the QUOTE ROSTER. Attribution format: text -- Person Name, Hedgeword. Quotes should sound like they COULD relate to the talk's theme.
 
-FAKE QUOTES: Use ONLY the people and hedge words provided in the QUOTE ROSTER. Attribution format: text -- Person Name, Hedgeword (no quotation marks in the JSON — the frontend adds them). Vary tone: technical, philosophical, practical, ominous, or surreal.
-
-IMAGE SEARCH TERMS: Must have ZERO connection to the slide. Use SPECIFIC, vivid, findable terms. NEVER generic terms like "abstract" or "technology".`;
+IMAGE SEARCH TERMS: Should have little or no connection to the slide. Use SPECIFIC, vivid, findable terms. NEVER generic terms like "abstract" or "technology".`;
 
 const DIFFICULTY_PROMPTS: Record<Difficulty, string> = {
   easy: `DIFFICULTY: EASY
 Generate EXACTLY 8 slides. Slide titles: 1–5 words. Subtitles: most empty, max 6 words when used.
-The presentation should stay LOOSELY connected to the original topic throughout — the humor comes from odd angles and strange takes, not total derailment. Still absurd, but the presenter can find a thread to follow.
+The presentation should stay connected to the original topic throughout. The humor comes from odd angles, strange takes, and unexpected expertise — not randomness. The presenter should be able to give a coherent (if weird) talk.
+Thematic arc: Title slide → problem statement → 2-3 supporting points → conclusion.
 Quotes on 1–2 slides (never slide 1). No chart slides. No audience participation slides.
-Speaker notes: max 15 words, mildly helpful but strange.
+Speaker notes: max 15 words, mildly helpful.
 Slide 1 is a title slide. Last slide is a slightly odd conclusion.`,
 
   medium: `DIFFICULTY: MEDIUM
-Generate EXACTLY 10 slides. Slide titles: 1–5 words. Subtitles: most empty, max 6 words when used, should CONTRADICT or DERAIL the title.
-By slide 5, the talk should have drifted into unrelated territory. Do not acknowledge the drift.
-Quotes on 2–3 slides (never slide 1). EXACTLY 1 chart slide — it MUST have a chartData array with 3-6 data points with absurd labels. 0–1 audience participation slides.
-Speaker notes: max 15 words, deadpan confident gibberish.
+Generate EXACTLY 10 slides. Slide titles: 1–5 words. Subtitles: most empty, max 6 words when used.
+The presentation starts connected to the topic but gradually drifts. By slide 7, the talk should have wandered into strange territory — but each slide should still connect to the one before it. The drift is gradual, not instant.
+Thematic arc: Title slide → problem statement → reasonable-sounding points → things get weird → bizarre conclusion.
+Quotes on 2–3 slides (never slide 1). EXACTLY 1 chart slide with a chartData array (3-6 data points, absurd labels). 0–1 audience participation slides.
+Speaker notes: max 15 words, deadpan confident.
 Slide 1 is a title slide. Last slide is a bizarre call to action.`,
 
-  hard: `DIFFICULTY: HARD — MAXIMUM CHAOS
-Generate EXACTLY 15 slides. Slide titles: 1–5 words. Subtitles: use more often, always contradicting or derailing the title.
-The presentation should abandon the topic by slide 3 and NEVER return. Each slide should feel like it belongs to a different presentation. The presenter should have NO idea what is happening.
-Quotes on 4–5 slides (never slide 1) — make them increasingly unhinged. EXACTLY 2 chart slides — each MUST have a chartData array with 4-6 data points with absurd labels and fabricated values. 1–2 audience participation slides with impossible requests.
+  hard: `DIFFICULTY: HARD
+Generate EXACTLY 15 slides. Slide titles: 1–5 words. Subtitles: use more often, can contradict the title.
+The presentation starts normally but derails fast. By slide 5, the talk should be in unexpected territory. Each slide still connects to the previous one, but the chain of logic leads somewhere insane. Think of it as a talk where every transition makes local sense but the global trajectory is unhinged.
+Thematic arc: Title slide → plausible start → gradual derailment → total madness → threatening conclusion.
+Quotes on 4–5 slides (never slide 1). EXACTLY 2 chart slides, each with a chartData array (4-6 data points, absurd labels). 1–2 audience participation slides.
 Speaker notes: max 15 words, actively misleading.
 Slide 1 is a title slide. Last slide should be a threat disguised as a thank-you.`,
 };
@@ -597,14 +600,14 @@ const CHAOS_VIBES = [
 ];
 
 function generateChaosSeed(): string {
-  const nouns = pickRandom(CHAOS_NOUNS, 4);
-  const adjs = pickRandom(CHAOS_ADJECTIVES, 3);
-  const domains = pickRandom(CHAOS_DOMAINS, 2);
+  const nouns = pickRandom(CHAOS_NOUNS, 3);
+  const adjs = pickRandom(CHAOS_ADJECTIVES, 2);
+  const domains = pickRandom(CHAOS_DOMAINS, 1);
   const vibe = pickRandom(CHAOS_VIBES, 1)[0];
-  return `CHAOS SEED — use these ONLY as background inspiration. Do NOT make any seed word a recurring theme. Use each word AT MOST once across all slides, then move on. The deck should feel varied, not themed around any single word.
+  return `FLAVOR SEED — optional seasoning. You may work 1-2 of these into the talk IF they fit naturally. The deck's coherence matters more than using these words. Ignore any that don't fit.
 Words: ${nouns.join(', ')}, ${adjs.join(', ')}
-Domains: ${domains.join(', ')}
-Vibe: ${vibe}`;
+Domain twist: ${domains.join(', ')}
+Overall tone: ${vibe}`;
 }
 
 function generateQuoteRoster(): string {
