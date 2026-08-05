@@ -54,7 +54,7 @@ const DIFFICULTY_CONFIG: Record<Difficulty, { slides: number; timer: number; des
   hard:   { slides: 15, timer: 5 * 60, description: 'maximum chaos, every slide is a trap, quotes everywhere' },
 };
 
-const MAX_RECENT = 10;
+const MAX_RECENT = 20;
 const DECK_TTL = 60 * 60 * 24 * 7; // 7 days
 
 // ================================================================
@@ -83,9 +83,11 @@ SLIDE STRUCTURE PATTERNS (vary which you use — never use all in one deck):
 - A countdown or "phase" that implies a terrifying plan.
 - A title that is a complete sentence but makes no sense.
 
-Some slides can be CHART slides — set the "chartData" field with data for a fake bar, pie, or line chart with absurd labels and values. Keep to 3-6 data points. Use this for 1-2 slides max. On chart slides, the chart IS the visual — still set imageQuery for a fallback but the chart will overlay it.
+CHART SLIDES — IMPORTANT: When a difficulty level says to include chart slides, you MUST set the "chartData" field to an array of objects like [{"label":"Cats","value":47},{"label":"Regret","value":83}]. Use 3-6 data points with absurd labels and made-up values. Labels should be funny and unexpected. Values can be any number. When chartData is null, there is no chart. When chartData is an array, a bar chart will be rendered on screen — this is the main visual for that slide.
 
-Some slides can be AUDIENCE PARTICIPATION slides — set "audience" to true. These display differently (big centered text, call-to-action styling). Use for 0-1 slides per deck.
+AUDIENCE PARTICIPATION SLIDES: When specified, set "audience" to true. The slide title becomes a big centered call-to-action (e.g., "Everyone stand up if you've ever debugged in production"). Keep chartData null on audience slides. Keep quote empty on audience slides.
+
+MUTUAL EXCLUSION: Each slide is ONE type only. A slide can have a quote OR chartData OR audience, NEVER more than one. Normal slides have all three empty/null/false.
 
 FAKE QUOTES: Use ONLY the people and hedge words provided in the QUOTE ROSTER. Attribution format: text -- Person Name, Hedgeword (no quotation marks in the JSON — the frontend adds them). Vary tone: technical, philosophical, practical, ominous, or surreal.
 
@@ -102,21 +104,21 @@ Slide 1 is a title slide. Last slide is a slightly odd conclusion.`,
   medium: `DIFFICULTY: MEDIUM
 Generate EXACTLY 10 slides. Slide titles: 1–5 words. Subtitles: most empty, max 6 words when used, should CONTRADICT or DERAIL the title.
 By slide 5, the talk should have drifted into unrelated territory. Do not acknowledge the drift.
-Quotes on 2–3 slides (never slide 1). 1 chart slide with absurd data. 0–1 audience participation slides.
+Quotes on 2–3 slides (never slide 1). EXACTLY 1 chart slide — it MUST have a chartData array with 3-6 data points with absurd labels. 0–1 audience participation slides.
 Speaker notes: max 15 words, deadpan confident gibberish.
 Slide 1 is a title slide. Last slide is a bizarre call to action.`,
 
   hard: `DIFFICULTY: HARD — MAXIMUM CHAOS
 Generate EXACTLY 15 slides. Slide titles: 1–5 words. Subtitles: use more often, always contradicting or derailing the title.
 The presentation should abandon the topic by slide 3 and NEVER return. Each slide should feel like it belongs to a different presentation. The presenter should have NO idea what is happening.
-Quotes on 4–5 slides (never slide 1) — make them increasingly unhinged. 1–2 chart slides with completely fabricated data. 1–2 audience participation slides with impossible requests.
+Quotes on 4–5 slides (never slide 1) — make them increasingly unhinged. EXACTLY 2 chart slides — each MUST have a chartData array with 4-6 data points with absurd labels and fabricated values. 1–2 audience participation slides with impossible requests.
 Speaker notes: max 15 words, actively misleading.
 Slide 1 is a title slide. Last slide should be a threat disguised as a thank-you.`,
 };
 
 function buildSystemPrompt(difficulty: Difficulty): string {
-  return BASE_PROMPT + '\n\n' + DIFFICULTY_PROMPTS[difficulty] + `\n\nOutput ONLY valid JSON:
-{"title":"Title","slides":[{"title":"T","subtitle":"","quote":"","chartData":null,"audience":false,"imageQuery":"photo","notes":"nonsense"}]}`;
+  return BASE_PROMPT + '\n\n' + DIFFICULTY_PROMPTS[difficulty] + `\n\nOutput ONLY valid JSON. Example structure with two slides (one normal, one chart):
+{"title":"Title","slides":[{"title":"T","subtitle":"","quote":"","chartData":null,"audience":false,"imageQuery":"photo","notes":"nonsense"},{"title":"Chart Title","subtitle":"","quote":"","chartData":[{"label":"Cats","value":47},{"label":"Regret","value":83},{"label":"Soup","value":12}],"audience":false,"imageQuery":"clouds","notes":"present this chart with confidence"}]}`;
 }
 
 // ================================================================
@@ -667,17 +669,29 @@ async function generatePresentation(env: Env, prompt: string, difficulty: Diffic
     throw new Error('Invalid presentation structure from AI');
   }
 
-  // Ensure each slide has all required fields
-  presentation.slides = presentation.slides.map(slide => ({
-    title: slide.title || 'Untitled',
-    subtitle: slide.subtitle || '',
-    quote: slide.quote || '',
-    chartData: Array.isArray(slide.chartData) ? slide.chartData : null,
-    audience: !!slide.audience,
-    imageQuery: slide.imageQuery || 'random object',
-    imageUrl: '',
-    notes: slide.notes || '',
-  }));
+  // Ensure each slide has all required fields and enforce mutual exclusion
+  presentation.slides = presentation.slides.map(slide => {
+    const hasChart = Array.isArray(slide.chartData) && slide.chartData.length > 0;
+    const hasAudience = !!slide.audience;
+    const hasQuote = !!(slide.quote && String(slide.quote).trim());
+
+    // Priority: audience > chart > quote (only one overlay per slide)
+    return {
+      title: slide.title || 'Untitled',
+      subtitle: slide.subtitle || '',
+      quote: (hasQuote && !hasAudience && !hasChart) ? String(slide.quote).trim() : '',
+      chartData: (hasChart && !hasAudience)
+        ? slide.chartData!.filter((d: any) => d && d.label != null && d.value != null).map((d: any) => ({
+            label: String(d.label),
+            value: Number(d.value) || 0,
+          }))
+        : null,
+      audience: hasAudience,
+      imageQuery: slide.imageQuery || 'random object',
+      imageUrl: '',
+      notes: slide.notes || '',
+    };
+  });
   presentation.difficulty = difficulty;
 
   // Fetch images in parallel
@@ -770,13 +784,15 @@ a { color: inherit; }
   position: fixed;
   inset: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.4s ease;
   z-index: 1;
   overflow-y: auto;
+  padding: 1.5rem 0;
 }
 .view.active {
   opacity: 1;
@@ -788,6 +804,7 @@ a { color: inherit; }
   width: min(800px, 100% - 2rem);
   display: grid;
   gap: 1.5rem;
+  margin: auto 0;
   animation: rise 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
@@ -1102,6 +1119,7 @@ a { color: inherit; }
   display: grid;
   gap: 1.2rem;
   justify-items: center;
+  margin: auto 0;
 }
 
 .hex-spinner {
@@ -1148,6 +1166,7 @@ a { color: inherit; }
   display: grid;
   gap: 1.2rem;
   justify-items: center;
+  margin: auto 0;
   animation: rise 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
@@ -1189,6 +1208,7 @@ a { color: inherit; }
 }
 
 /* ---- PRESENTATION ---- */
+#view-presentation { padding: 0; }
 .slide-container {
   position: fixed;
   inset: 0;
@@ -1581,6 +1601,7 @@ a { color: inherit; }
   display: grid;
   gap: 1.5rem;
   justify-items: center;
+  margin: auto 0;
   animation: rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
@@ -1614,6 +1635,7 @@ a { color: inherit; }
   justify-items: center;
   max-width: 500px;
   padding: 2rem;
+  margin: auto 0;
 }
 
 .error-container h2 {
@@ -1655,7 +1677,16 @@ a { color: inherit; }
   display: grid;
   gap: 0.5rem;
   min-width: 0;
+  max-height: 11rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted) transparent;
+  padding-right: 0.25rem;
 }
+.recent-list::-webkit-scrollbar { width: 5px; }
+.recent-list::-webkit-scrollbar-track { background: transparent; }
+.recent-list::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 3px; }
 
 .recent-card {
   border: 1px solid var(--rule);
@@ -1837,7 +1868,7 @@ a { color: inherit; }
           type="text"
           id="presenter-input"
           class="presenter-input"
-          placeholder="Presenter name (optional)"
+          placeholder="Speaker name"
           maxlength="60"
           autocomplete="off"
         >
@@ -1972,6 +2003,39 @@ a { color: inherit; }
   var notesVisible = false;
   var selectedDifficulty = 'medium';
   var presenterName = '';
+
+  // ---- Fake presenter names ----
+  var FAKE_NAMES = [
+    'Ms. Kari Oakie',
+    'Mr. Pre Senter',
+    'Dr. Slide Deckson',
+    'Prof. Tal King-Point',
+    'Ms. Power Pointless',
+    'Mr. Bul Letpoint',
+    'Dr. Laz R. Pointer',
+    'Ms. Kee Note',
+    'Mr. Mike Rofone',
+    'Prof. Audi Torium',
+    'Dr. Pro Jector',
+    'Ms. Fli Pchard',
+    'Mr. Ted Talke',
+    'Prof. Stan Dupcomedy',
+    'Dr. Poddy Umm',
+    'Ms. Tele Prompter',
+    'Mr. Q. N. Ay',
+    'Prof. Handz Outt',
+    'Dr. Cliff Hanger',
+    'Ms. Seg Way',
+    'Mr. Lec Tern',
+    'Prof. No Tess',
+    'Dr. Winging-Itt',
+    'Ms. Awk Wardpause',
+    'Mr. Nex Slide',
+  ];
+
+  function randomFakeName() {
+    return FAKE_NAMES[Math.floor(Math.random() * FAKE_NAMES.length)];
+  }
 
   // ---- Random topics ----
   var TOPICS = [
@@ -2401,6 +2465,7 @@ a { color: inherit; }
     history.replaceState(null, '', '/');
     showView('landing');
     presentation = null;
+    els.presenterInput.value = randomFakeName();
   }
 
   function toggleNotes() {
@@ -2610,6 +2675,7 @@ a { color: inherit; }
 
   // ---- Boot: check for /p/:id deep link, otherwise show landing ----
   (function boot() {
+    els.presenterInput.value = randomFakeName();
     var match = location.pathname.match(/^\\/p\\/([a-z0-9]+)$/);
     if (match) {
       loadDeck(match[1]);
