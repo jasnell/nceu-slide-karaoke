@@ -404,6 +404,53 @@ People: ${people.join(', ')}
 Hedge words: ${hedges.join(', ')}`;
 }
 
+// ================================================================
+// CONTENT MODERATION
+// ================================================================
+
+async function moderatePrompt(env: Env, prompt: string): Promise<{ safe: boolean; reason?: string }> {
+  // Layer 1: quick blocklist for obvious stuff
+  const lower = prompt.toLowerCase();
+  const blocked = [
+    'nsfw', 'porn', 'nude', 'naked', 'sex', 'hentai', 'xxx',
+    'kill', 'murder', 'suicide', 'bomb', 'terror',
+    'racial', 'racist', 'slur', 'nazi', 'hitler',
+    'drug', 'cocaine', 'heroin', 'meth',
+  ];
+  for (const word of blocked) {
+    // Match whole words only
+    if (new RegExp(`\\b${word}\\b`, 'i').test(lower)) {
+      return { safe: false, reason: 'That topic is not appropriate for this game. Try something else!' };
+    }
+  }
+
+  // Layer 2: use Llama Guard for nuanced content safety
+  try {
+    const guardResponse = await env.AI.run(
+      '@cf/meta/llama-guard-3-8b' as Parameters<typeof env.AI.run>[0],
+      {
+        messages: [
+          { role: 'user', content: prompt },
+        ],
+      }
+    );
+
+    const result = extractAIText(guardResponse).trim().toLowerCase();
+    // Llama Guard returns "safe" or "unsafe\n<category>" 
+    if (result.startsWith('unsafe')) {
+      console.log('Llama Guard flagged prompt:', prompt, '→', result);
+      return { safe: false, reason: 'That topic was flagged as inappropriate. Try something else!' };
+    }
+  } catch (e) {
+    // If the guard model fails, let it through — the system prompt
+    // still enforces SFW output, and we'd rather not block legitimate
+    // prompts due to a model hiccup.
+    console.error('Llama Guard error (allowing prompt through):', e);
+  }
+
+  return { safe: true };
+}
+
 async function generatePresentation(env: Env, prompt: string): Promise<Presentation> {
   const chaosSeed = generateChaosSeed();
   const quoteRoster = generateQuoteRoster();
@@ -1945,6 +1992,15 @@ export default {
         if (prompt.length > 200) {
           return Response.json(
             { error: 'Topic is too long. Keep it under 200 characters.' },
+            { status: 400 }
+          );
+        }
+
+        // Content moderation
+        const modResult = await moderatePrompt(env, prompt);
+        if (!modResult.safe) {
+          return Response.json(
+            { error: modResult.reason || 'That topic is not appropriate for this game.' },
             { status: 400 }
           );
         }
