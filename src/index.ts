@@ -619,20 +619,23 @@ Hedge words: ${hedges.join(', ')}`;
 // CONTENT MODERATION
 // ================================================================
 
+const BLOCKED_TERMS = [
+  'nsfw', 'porn', 'nude', 'naked', 'sex', 'hentai', 'xxx',
+  'kill', 'murder', 'suicide', 'bomb', 'terror',
+  'racial', 'racist', 'slur', 'nazi', 'hitler',
+  'drug', 'cocaine', 'heroin', 'meth',
+];
+
+/** Fast blocklist check — returns true if text contains a blocked word. */
+function containsBlockedTerm(text: string): boolean {
+  const lower = text.toLowerCase();
+  return BLOCKED_TERMS.some(word => new RegExp(`\\b${word}\\b`, 'i').test(lower));
+}
+
 async function moderatePrompt(env: Env, prompt: string): Promise<{ safe: boolean; reason?: string }> {
   // Layer 1: quick blocklist for obvious stuff
-  const lower = prompt.toLowerCase();
-  const blocked = [
-    'nsfw', 'porn', 'nude', 'naked', 'sex', 'hentai', 'xxx',
-    'kill', 'murder', 'suicide', 'bomb', 'terror',
-    'racial', 'racist', 'slur', 'nazi', 'hitler',
-    'drug', 'cocaine', 'heroin', 'meth',
-  ];
-  for (const word of blocked) {
-    // Match whole words only
-    if (new RegExp(`\\b${word}\\b`, 'i').test(lower)) {
-      return { safe: false, reason: 'That topic is not appropriate for this game. Try something else!' };
-    }
+  if (containsBlockedTerm(prompt)) {
+    return { safe: false, reason: 'That topic is not appropriate for this game. Try something else!' };
   }
 
   // Layer 2: use Llama Guard for nuanced content safety
@@ -1105,19 +1108,7 @@ a { color: inherit; }
 }
 .diff-btn.active .diff-desc { color: var(--accent); }
 
-.presenter-input {
-  border: 1px solid var(--rule);
-  background: var(--surface-elevated);
-  color: var(--ink);
-  font-family: var(--body);
-  font-size: 0.92rem;
-  padding: 0.6rem 1rem;
-  width: 100%;
-  outline: none;
-  transition: border-color 0.15s;
-}
-.presenter-input::placeholder { color: var(--muted); }
-.presenter-input:focus { border-color: var(--accent); }
+
 
 .suggestions {
   display: flex;
@@ -1914,14 +1905,7 @@ a { color: inherit; }
           <button type="button" class="diff-btn active" data-diff="medium">Medium<span class="diff-desc">10 slides, absurd</span></button>
           <button type="button" class="diff-btn" data-diff="hard">Hard<span class="diff-desc">15 slides, unhinged</span></button>
         </div>
-        <input
-          type="text"
-          id="presenter-input"
-          class="presenter-input"
-          placeholder="Speaker name"
-          maxlength="60"
-          autocomplete="off"
-        >
+
         <button type="submit" id="submit-btn" class="button button-primary">
           <span class="hex-icon">&#x25C6;</span> Generate Slides
         </button>
@@ -2131,7 +2115,7 @@ a { color: inherit; }
     input:          document.getElementById('prompt-input'),
     submitBtn:      document.getElementById('submit-btn'),
     instantBtn:     document.getElementById('instant-btn'),
-    presenterInput: document.getElementById('presenter-input'),
+
     randomBtn:      document.getElementById('random-btn'),
     loadingStatus:  document.getElementById('loading-status'),
     readyTitle:     document.getElementById('ready-title'),
@@ -2271,7 +2255,7 @@ a { color: inherit; }
 
   // ---- Generate presentation ----
   async function generate(prompt) {
-    presenterName = (els.presenterInput.value || '').trim();
+    presenterName = randomFakeName();
     showView('loading');
     els.loadingStatus.textContent = 'Asking the AI for something truly unhinged';
 
@@ -2515,7 +2499,6 @@ a { color: inherit; }
     history.replaceState(null, '', '/');
     showView('landing');
     presentation = null;
-    els.presenterInput.value = randomFakeName();
   }
 
   function toggleNotes() {
@@ -2623,7 +2606,7 @@ a { color: inherit; }
 
   // ---- Instant Play ----
   els.instantBtn.addEventListener('click', function() {
-    presenterName = (els.presenterInput.value || '').trim();
+    presenterName = randomFakeName();
     els.instantBtn.disabled = true;
     showView('loading');
     els.loadingStatus.textContent = 'Grabbing a pre-made deck';
@@ -2725,7 +2708,6 @@ a { color: inherit; }
 
   // ---- Boot: check for /p/:id deep link, otherwise show landing ----
   (function boot() {
-    els.presenterInput.value = randomFakeName();
     var match = location.pathname.match(/^\\/p\\/([a-z0-9]+)$/);
     if (match) {
       loadDeck(match[1]);
@@ -2825,7 +2807,7 @@ export default {
           );
         }
 
-        // Content moderation
+        // Content moderation — topic
         const modResult = await moderatePrompt(env, prompt);
         if (!modResult.safe) {
           return Response.json(
