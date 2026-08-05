@@ -13,6 +13,10 @@ id = "77812cfedf81402391e11563dc676308"
 #   npx wrangler kv namespace create DECKS
 # then paste the returned id above.
 
+# Pre-generate decks every 10 minutes to keep the instant-play pool stocked.
+[triggers]
+crons = ["*/10 * * * *"]
+
 # --- Image API keys (set one or both for keyword-matched photos) ---
 # Each slide randomly picks a source for visual variety.
 # Without any keys, slides fall back to random Lorem Picsum photos.

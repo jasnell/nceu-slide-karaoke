@@ -273,6 +273,132 @@ async function getRecent(env: Env): Promise<RecentEntry[]> {
 }
 
 // ================================================================
+// PRE-GENERATION POOL
+// ================================================================
+
+const POOL_TTL = 7200;         // 2 hours
+const POOL_TARGET_SIZE = 3;    // per difficulty
+const POOL_DIFFICULTIES: Difficulty[] = ['easy', 'medium'];
+
+async function getPoolIds(env: Env, difficulty: Difficulty): Promise<string[]> {
+  const raw = await env.DECKS.get(`pool-index:${difficulty}`);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function setPoolIds(env: Env, difficulty: Difficulty, ids: string[]): Promise<void> {
+  await env.DECKS.put(`pool-index:${difficulty}`, JSON.stringify(ids));
+}
+
+/** Store a pre-generated deck in the pool. */
+async function addToPool(env: Env, difficulty: Difficulty, prompt: string, pres: Presentation): Promise<void> {
+  const id = generateId();
+  const stored: StoredPresentation = {
+    ...pres,
+    id,
+    prompt,
+    createdAt: new Date().toISOString(),
+  };
+  await env.DECKS.put(`pool:${difficulty}:${id}`, JSON.stringify(stored), { expirationTtl: POOL_TTL });
+
+  const ids = await getPoolIds(env, difficulty);
+  ids.push(id);
+  await setPoolIds(env, difficulty, ids);
+}
+
+/** Pop a deck from the pool. Returns null if empty. */
+async function popFromPool(env: Env, difficulty: Difficulty): Promise<StoredPresentation | null> {
+  const ids = await getPoolIds(env, difficulty);
+  while (ids.length > 0) {
+    const id = ids.shift()!;
+    await setPoolIds(env, difficulty, ids);
+    const raw = await env.DECKS.get(`pool:${difficulty}:${id}`);
+    if (raw) {
+      // Move from pool to regular deck storage so it gets a share URL
+      const deck: StoredPresentation = JSON.parse(raw);
+      await env.DECKS.put(`deck:${deck.id}`, raw, { expirationTtl: DECK_TTL });
+      await env.DECKS.delete(`pool:${difficulty}:${id}`);
+      // Add to recent list
+      const recentRaw = await env.DECKS.get('recent');
+      let recent: RecentEntry[] = recentRaw ? JSON.parse(recentRaw) : [];
+      recent.unshift({ id: deck.id, title: deck.title, prompt: deck.prompt || '', difficulty: deck.difficulty || 'medium', createdAt: deck.createdAt });
+      recent = recent.slice(0, MAX_RECENT);
+      await env.DECKS.put('recent', JSON.stringify(recent));
+      return deck;
+    }
+  }
+  return null;
+}
+
+/** Generate a random topic (server-side, no rate limit). */
+async function generateRandomTopic(env: Env): Promise<string> {
+  const categories = [
+    'corporate strategy meeting', 'engineering all-hands', 'HR workshop',
+    'product launch event', 'investor pitch', 'academic conference paper',
+    'TED-style talk', 'board of directors quarterly review', 'startup demo day',
+    'safety compliance seminar', 'research symposium', 'trade show panel',
+  ];
+  const flavors = [
+    'about an extremely specific niche topic',
+    'that sounds important but is about something trivial',
+    'that combines two unrelated fields',
+    'about an everyday object treated with extreme seriousness',
+    'that a middle manager would propose with total confidence',
+    'that sounds like it was auto-generated from buzzwords',
+  ];
+  const category = categories[Math.floor(Math.random() * categories.length)];
+  const flavor = flavors[Math.floor(Math.random() * flavors.length)];
+  const seedWords = pickRandom(CHAOS_NOUNS, 2).join(', ');
+
+  const aiResponse = await env.AI.run(
+    '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    {
+      messages: [
+        { role: 'system', content: 'You output a single presentation title, 3-8 words. Nothing else.' },
+        { role: 'user', content: `Invent one topic for a ${category} ${flavor}. Inspired by: ${seedWords}. Just the title.` },
+      ],
+      max_tokens: 30,
+      temperature: 1.0,
+    }
+  );
+  const topic = extractAIText(aiResponse)
+    .replace(/^["'*\s]+|["'*\s.]+$/g, '')
+    .replace(/^(Title|Topic|Here|Sure)[:\s]*/i, '')
+    .trim();
+  if (!topic || topic.length < 5) throw new Error('Empty topic');
+  return topic;
+}
+
+/** Called by cron: top up the pool to POOL_TARGET_SIZE per difficulty. */
+async function refillPool(env: Env): Promise<void> {
+  for (const diff of POOL_DIFFICULTIES) {
+    // Prune expired entries
+    const ids = await getPoolIds(env, diff);
+    const valid: string[] = [];
+    for (const id of ids) {
+      const exists = await env.DECKS.get(`pool:${diff}:${id}`);
+      if (exists) valid.push(id);
+    }
+    await setPoolIds(env, diff, valid);
+
+    const needed = POOL_TARGET_SIZE - valid.length;
+    if (needed <= 0) continue;
+
+    // Generate up to 2 per invocation to stay within CPU limits
+    const toGen = Math.min(needed, 2);
+    for (let i = 0; i < toGen; i++) {
+      try {
+        const topic = await generateRandomTopic(env);
+        const pres = await generatePresentation(env, topic, diff);
+        await addToPool(env, diff, topic, pres);
+        console.log(`Pool: added ${diff} deck "${topic}"`);
+      } catch (e) {
+        console.error(`Pool: failed to generate ${diff} deck:`, e);
+      }
+    }
+  }
+}
+
+// ================================================================
 // IMAGE FETCHING — multiple sources for variety
 // ================================================================
 
@@ -850,6 +976,24 @@ a { color: inherit; }
   cursor: not-allowed;
   transform: none;
   box-shadow: var(--shadow-hard-sm);
+}
+
+.button-instant {
+  background: transparent;
+  color: var(--accent);
+  border: 2px solid var(--accent);
+  width: 100%;
+  margin-top: 0.5rem;
+  font-size: 0.95rem;
+}
+.button-instant:hover {
+  background: var(--accent);
+  color: #14110c;
+}
+.button-instant:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .hex-icon {
@@ -1597,12 +1741,55 @@ a { color: inherit; }
   .suggestions { gap: 0.35rem; }
 }
 
-/* ---- TRANSITION ---- */
+/* ---- TRANSITIONS ---- */
 .fade-content {
-  transition: opacity 0.35s ease;
+  transition: opacity 0.35s ease, transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: translate(0, 0) scale(1);
 }
-.fade-content.fading {
-  opacity: 0;
+.fade-content.fading { opacity: 0; }
+.fade-content.fading.tr-slide-up    { transform: translateY(30px); }
+.fade-content.fading.tr-slide-left  { transform: translateX(40px); }
+.fade-content.fading.tr-zoom        { transform: scale(0.92); }
+
+/* ---- TITLE SLIDE (slide 0) ---- */
+.slide-content.is-title-slide {
+  top: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  padding: clamp(2rem, 5vw, 4rem);
+}
+.slide-content.is-title-slide .slide-title {
+  font-size: clamp(3.5rem, 10vw, 9rem);
+  font-variation-settings: "opsz" 144, "SOFT" 100, "WONK" 1;
+  font-style: italic;
+  line-height: 0.88;
+}
+.slide-content.is-title-slide .slide-subtitle {
+  font-size: clamp(1.2rem, 3.5vw, 2.2rem);
+}
+.slide-content.is-title-slide .slide-presenter {
+  font-size: clamp(0.9rem, 2.5vw, 1.3rem);
+}
+
+/* ---- QR CODE (fin view) ---- */
+.fin-qr {
+  margin-top: 0.5rem;
+}
+.fin-qr canvas {
+  border: 3px solid var(--ink);
+  background: #fff;
+}
+.fin-share-hint {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.3rem;
+  word-break: break-all;
+  max-width: 22rem;
 }
 </style>
 </head>
@@ -1658,6 +1845,10 @@ a { color: inherit; }
           <span class="hex-icon">&#x25C6;</span> Generate Slides
         </button>
       </form>
+
+      <button id="instant-btn" class="button button-instant" title="Grab a pre-generated deck and start immediately">
+        <span class="hex-icon">&#x26A1;</span> Instant Play
+      </button>
 
       <div class="suggestions">
         <span>Try:</span>
@@ -1752,6 +1943,8 @@ a { color: inherit; }
   <div class="fin-container">
     <h1>Fin.</h1>
     <p class="fin-title" id="fin-title"></p>
+    <div class="fin-qr" id="fin-qr"></div>
+    <p class="fin-share-hint" id="fin-share-hint"></p>
     <button id="new-btn" class="button button-primary">
       <span class="hex-icon">&#x25C6;</span> New Presentation
     </button>
@@ -1823,6 +2016,7 @@ a { color: inherit; }
     form:           document.getElementById('generate-form'),
     input:          document.getElementById('prompt-input'),
     submitBtn:      document.getElementById('submit-btn'),
+    instantBtn:     document.getElementById('instant-btn'),
     presenterInput: document.getElementById('presenter-input'),
     randomBtn:      document.getElementById('random-btn'),
     loadingStatus:  document.getElementById('loading-status'),
@@ -1852,6 +2046,8 @@ a { color: inherit; }
     audienceText:   document.getElementById('slide-audience-text'),
     notesText:      document.getElementById('notes-text'),
     finTitle:       document.getElementById('fin-title'),
+    finQr:          document.getElementById('fin-qr'),
+    finShareHint:   document.getElementById('fin-share-hint'),
     newBtn:         document.getElementById('new-btn'),
     errorMessage:   document.getElementById('error-message'),
     retryBtn:       document.getElementById('retry-btn'),
@@ -2046,6 +2242,32 @@ a { color: inherit; }
     return '';
   }
 
+  // ---- QR Code generator (minimal, alphanumeric mode, version 2-4) ----
+  function renderQR(container, text, size) {
+    // Use a canvas with a third-party-free approach:
+    // Encode as a QR-like grid via a simple data URL through an img tag
+    // pointing at a chart API endpoint (public, no key needed)
+    var img = document.createElement('img');
+    img.width = size;
+    img.height = size;
+    img.style.imageRendering = 'pixelated';
+    img.alt = 'QR code: ' + text;
+    // Use the qrserver.com open API (no key, no tracking, HTTPS)
+    img.src = 'https://api.qrserver.com/v1/create-qr-code/?size='
+      + size + 'x' + size
+      + '&data=' + encodeURIComponent(text)
+      + '&margin=1&format=png';
+    container.appendChild(img);
+  }
+
+  // ---- Slide transitions ----
+  var TR_CLASSES = ['tr-slide-up', 'tr-slide-left', 'tr-zoom'];
+  function pickTransition(el) {
+    TR_CLASSES.forEach(function(c) { el.classList.remove(c); });
+    var pick = TR_CLASSES[Math.floor(Math.random() * TR_CLASSES.length)];
+    el.classList.add(pick);
+  }
+
   // ---- Slide rendering ----
   function renderSlide(index) {
     if (!presentation || index < 0 || index >= presentation.slides.length) return;
@@ -2053,11 +2275,19 @@ a { color: inherit; }
     var slide = presentation.slides[index];
     currentSlide = index;
 
-    // Fade out everything
+    // Pick random transition and fade out
+    pickTransition(els.slideTextContent);
     els.slideTextContent.classList.add('fading');
     els.slideQuoteContainer.classList.remove('visible');
     els.chartContainer.classList.remove('visible');
     els.audienceOverlay.classList.remove('visible');
+
+    // Title-slide layout toggle
+    if (index === 0) {
+      els.slideTextContent.classList.add('is-title-slide');
+    } else {
+      els.slideTextContent.classList.remove('is-title-slide');
+    }
 
     // Load background
     var bg = els.slideBg;
@@ -2136,6 +2366,14 @@ a { color: inherit; }
       renderSlide(currentSlide + 1);
     } else {
       els.finTitle.textContent = presentation.title;
+      // QR code for share URL
+      els.finQr.innerHTML = '';
+      els.finShareHint.textContent = '';
+      if (presentation.id) {
+        var shareUrl = location.origin + '/p/' + presentation.id;
+        els.finShareHint.textContent = shareUrl;
+        try { renderQR(els.finQr, shareUrl, 160); } catch(e) { /* skip QR on error */ }
+      }
       showView('fin');
     }
   }
@@ -2265,6 +2503,37 @@ a { color: inherit; }
     btn.addEventListener('click', function() {
       els.input.value = btn.textContent;
       els.input.focus();
+    });
+  });
+
+  // ---- Instant Play ----
+  els.instantBtn.addEventListener('click', function() {
+    presenterName = (els.presenterInput.value || '').trim();
+    els.instantBtn.disabled = true;
+    showView('loading');
+    els.loadingStatus.textContent = 'Grabbing a pre-made deck';
+    fetch('/api/instant', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ difficulty: selectedDifficulty }),
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) {
+        // No pool decks — fall back to normal generate with random topic
+        els.loadingStatus.textContent = 'No instant decks ready, generating fresh';
+        var fallback = TOPICS[Math.floor(Math.random() * TOPICS.length)];
+        return generate(fallback);
+      }
+      presentation = data;
+      showReadyScreen();
+    })
+    .catch(function(err) {
+      els.errorMsg.textContent = err.message || 'Failed to load instant deck.';
+      showView('error');
+    })
+    .finally(function() {
+      els.instantBtn.disabled = false;
     });
   });
 
@@ -2558,6 +2827,43 @@ export default {
       }
     }
 
+    // API: instant play — pop a pre-generated deck from the pool
+    if (url.pathname === '/api/instant' && request.method === 'POST') {
+      try {
+        const ip = getClientIP(request);
+        const rl = await checkRateLimit(env.DECKS, `gen:${ip}`, RATE_LIMIT_GENERATE);
+        if (!rl.allowed) {
+          return Response.json(
+            { error: 'Slow down! Try again in a few minutes.' },
+            { status: 429, headers: { 'Retry-After': String(RATE_LIMIT_GENERATE.windowSeconds) } }
+          );
+        }
+
+        const body = await request.json() as { difficulty?: string };
+        const difficulty: Difficulty = (body.difficulty === 'easy' || body.difficulty === 'hard') ? body.difficulty : 'medium';
+        const deck = await popFromPool(env, difficulty);
+        if (!deck) {
+          return Response.json({ error: 'No instant decks available. Use the normal generate button instead!' }, { status: 404 });
+        }
+        return Response.json(deck);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return Response.json({ error: message }, { status: 500 });
+      }
+    }
+
+    // API: pool status (for debugging)
+    if (url.pathname === '/api/pool-status' && request.method === 'GET') {
+      const easy = await getPoolIds(env, 'easy');
+      const medium = await getPoolIds(env, 'medium');
+      return Response.json({ easy: easy.length, medium: medium.length, target: POOL_TARGET_SIZE });
+    }
+
     return new Response('Not found', { status: 404 });
+  },
+
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    console.log('Scheduled: refilling pre-generation pool');
+    await refillPool(env);
   },
 };
