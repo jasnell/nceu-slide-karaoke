@@ -1959,6 +1959,43 @@ a { color: inherit; }
 </html>`;
 
 // ================================================================
+// RATE LIMITING
+// ================================================================
+
+const RATE_LIMIT_GENERATE = { maxRequests: 10, windowSeconds: 300 }; // 10 per 5 min
+const RATE_LIMIT_RANDOM   = { maxRequests: 30, windowSeconds: 60 };  // 30 per min
+
+function getClientIP(request: Request): string {
+  return request.headers.get('CF-Connecting-IP')
+    || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
+    || 'unknown';
+}
+
+async function checkRateLimit(
+  kv: KVNamespace,
+  key: string,
+  limit: { maxRequests: number; windowSeconds: number },
+): Promise<{ allowed: boolean; remaining: number }> {
+  const now = Math.floor(Date.now() / 1000);
+  const kvKey = `rl:${key}`;
+
+  const raw = await kv.get(kvKey);
+  let timestamps: number[] = raw ? JSON.parse(raw) : [];
+
+  // Drop entries outside the window
+  const cutoff = now - limit.windowSeconds;
+  timestamps = timestamps.filter(t => t > cutoff);
+
+  if (timestamps.length >= limit.maxRequests) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  timestamps.push(now);
+  await kv.put(kvKey, JSON.stringify(timestamps), { expirationTtl: limit.windowSeconds + 10 });
+  return { allowed: true, remaining: limit.maxRequests - timestamps.length };
+}
+
+// ================================================================
 // REQUEST HANDLER
 // ================================================================
 
@@ -1979,6 +2016,16 @@ export default {
     // API: generate presentation
     if (url.pathname === '/api/generate' && request.method === 'POST') {
       try {
+        // Rate limit
+        const ip = getClientIP(request);
+        const rl = await checkRateLimit(env.DECKS, `gen:${ip}`, RATE_LIMIT_GENERATE);
+        if (!rl.allowed) {
+          return Response.json(
+            { error: 'Slow down! Too many presentations generated. Try again in a few minutes.' },
+            { status: 429, headers: { 'Retry-After': String(RATE_LIMIT_GENERATE.windowSeconds) } }
+          );
+        }
+
         const body = await request.json() as { prompt?: string };
         const prompt = body.prompt?.trim();
 
@@ -2041,6 +2088,18 @@ export default {
     // API: generate a random topic via AI
     if (url.pathname === '/api/random-topic' && request.method === 'GET') {
       try {
+        // Rate limit
+        const ip = getClientIP(request);
+        const rl = await checkRateLimit(env.DECKS, `rnd:${ip}`, RATE_LIMIT_RANDOM);
+        if (!rl.allowed) {
+          // Silent fallback to local list instead of error — better UX for a button mash
+          const fallbacks = [
+            'Quarterly sales report', 'Introduction to Node.js',
+            'Cloud migration strategy', 'Team building workshop',
+          ];
+          return Response.json({ topic: fallbacks[Math.floor(Math.random() * fallbacks.length)] });
+        }
+
         // Random category and seed words to steer the model away from repetition
         const categories = [
           'corporate strategy meeting', 'engineering all-hands', 'HR workshop',
