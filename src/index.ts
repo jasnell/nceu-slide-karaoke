@@ -483,47 +483,84 @@ function extractJSON(raw: string): string {
   return text.slice(start);
 }
 
-// Word pools for the chaos seed — drawn from wildly different domains
+// Word pools for the chaos seed — large pools to prevent repetition
 const CHAOS_NOUNS = [
-  'accordion', 'avalanche', 'barnacle', 'basilisk', 'brisket', 'cardamom', 'centrifuge',
-  'chandelier', 'clementine', 'cobalt', 'corduroy', 'cuttlefish', 'dirigible', 'dolomite',
-  'echidna', 'euphonium', 'feldspar', 'fjord', 'gazpacho', 'gondola', 'harpsichord',
-  'hedgehog', 'heirloom', 'isthmus', 'jackhammer', 'kumquat', 'labyrinth', 'lozenge',
-  'macramé', 'mandolin', 'narwhal', 'nutmeg', 'obsidian', 'origami', 'pangolin',
-  'paprika', 'parsnip', 'pelican', 'periscope', 'phosphorus', 'platypus', 'pomegranate',
-  'porcelain', 'quasar', 'quicksand', 'rhubarb', 'rucksack', 'saffron', 'salamander',
-  'scaffolding', 'sequoia', 'sextant', 'shrapnel', 'sousaphone', 'stalagmite', 'strudel',
-  'sundial', 'tapestry', 'tarantula', 'terracotta', 'thimble', 'toboggan', 'trombone',
-  'tundra', 'turmeric', 'turnstile', 'umbrella', 'velociraptor', 'vermicelli', 'walrus',
-  'wheelbarrow', 'xylophone', 'yak', 'zeppelin', 'anchovy', 'armadillo', 'balustrade',
-  'binoculars', 'burlap', 'cantaloupe', 'carousel', 'catamaran', 'chutney', 'coriander',
-  'croissant', 'dachshund', 'dragonfly', 'duvet', 'easel', 'elderberry', 'flamingo',
-  'funicular', 'gargoyle', 'glockenspiel', 'gymnasium', 'hammock', 'igloo', 'javelin',
-  'kaleidoscope', 'kiln', 'lantern', 'linoleum', 'macaroon', 'mongoose', 'monocle',
-  'nectarine', 'obelisk', 'ottoman', 'parabola', 'pinecone', 'prism', 'quiche',
-  'rampart', 'rutabaga', 'scalpel', 'tobasco', 'trebuchet', 'tugboat', 'turnip',
-  'uvula', 'vestibule', 'waffle', 'yodel', 'zucchini',
+  // animals
+  'albatross', 'armadillo', 'axolotl', 'capybara', 'cassowary', 'chinchilla', 'cuttlefish',
+  'dachshund', 'dragonfly', 'echidna', 'flamingo', 'gecko', 'heron', 'ibis', 'jackal',
+  'jellyfish', 'lemur', 'manatee', 'mongoose', 'narwhal', 'ocelot', 'pangolin', 'pelican',
+  'platypus', 'porcupine', 'quokka', 'salamander', 'seahorse', 'sloth', 'tapir',
+  'tardigrade', 'toucan', 'velociraptor', 'walrus', 'wombat', 'yak',
+  // food & plants
+  'arugula', 'brisket', 'cardamom', 'clementine', 'coriander', 'croissant', 'elderberry',
+  'falafel', 'ginger', 'horseradish', 'kumquat', 'lychee', 'marzipan', 'nectarine',
+  'parsnip', 'persimmon', 'pomelo', 'rutabaga', 'saffron', 'sourdough', 'tamarind',
+  'turmeric', 'wasabi', 'watercress', 'brioche', 'focaccia', 'gnocchi', 'polenta',
+  // instruments & music
+  'accordion', 'banjo', 'calliope', 'didgeridoo', 'euphonium', 'flugelhorn',
+  'glockenspiel', 'harmonica', 'harpsichord', 'mandolin', 'sousaphone', 'theremin',
+  'trombone', 'ukulele', 'xylophone',
+  // objects & tools
+  'abacus', 'anvil', 'barometer', 'bellows', 'binoculars', 'caliper', 'centrifuge',
+  'chandelier', 'compass', 'corkscrew', 'easel', 'funnel', 'hourglass', 'jackhammer',
+  'kaleidoscope', 'lantern', 'magnifying glass', 'metronome', 'pendulum', 'periscope',
+  'protractor', 'sextant', 'sundial', 'telescope', 'thermos', 'thimble', 'turnstile',
+  'wheelbarrow', 'wrench',
+  // geology & geography
+  'archipelago', 'basalt', 'canyon', 'cobalt', 'delta', 'dolomite', 'estuary',
+  'feldspar', 'fjord', 'glacier', 'geyser', 'isthmus', 'limestone', 'mesa',
+  'obsidian', 'plateau', 'quartz', 'stalactite', 'tundra', 'volcano',
+  // architecture & materials
+  'aqueduct', 'balustrade', 'buttress', 'cornice', 'cupola', 'dormer', 'gargoyle',
+  'gazebo', 'grout', 'linoleum', 'minaret', 'obelisk', 'parapet', 'porcelain',
+  'rotunda', 'scaffolding', 'terracotta', 'vestibule', 'viaduct',
+  // transport
+  'blimp', 'catamaran', 'dirigible', 'funicular', 'gondola', 'kayak',
+  'monowheel', 'toboggan', 'tugboat', 'zeppelin',
+  // textiles & crafts
+  'burlap', 'corduroy', 'crochet', 'macramé', 'origami', 'patchwork',
+  'tapestry', 'velvet', 'wicker',
+  // misc
+  'boomerang', 'candelabra', 'decoy', 'diorama', 'gauntlet', 'hammock', 'igloo',
+  'kiln', 'labyrinth', 'lozenge', 'monocle', 'parabola', 'prism', 'quasar',
+  'rucksack', 'semaphore', 'silo', 'surplus', 'trapeze', 'umbrella', 'vacuum',
+  'ventriloquist', 'whirlpool', 'windmill',
 ];
 
 const CHAOS_ADJECTIVES = [
   'translucent', 'carbonated', 'gelatinous', 'magnetic', 'perpendicular', 'fossilized',
   'turbulent', 'iridescent', 'combustible', 'aerodynamic', 'subterranean', 'invertible',
   'centrifugal', 'holographic', 'amphibious', 'hydraulic', 'galvanized', 'pressurized',
-  'fermented', 'crystalline', 'buoyant', 'recursive', 'vestigial', 'molten', 'tectonic',
-  'plaid', 'lukewarm', 'wobbling', 'upholstered', 'unlicensed', 'artisanal', 'volatile',
-  'sentient', 'tandem', 'concentric', 'complimentary', 'nomadic', 'load-bearing',
+  'crystalline', 'buoyant', 'recursive', 'vestigial', 'molten', 'tectonic',
+  'plaid', 'lukewarm', 'wobbling', 'upholstered', 'unlicensed', 'volatile',
+  'sentient', 'tandem', 'concentric', 'nomadic', 'load-bearing',
+  'bifurcated', 'contraband', 'decommissioned', 'elliptical', 'fortified',
+  'hermetically sealed', 'inverted', 'laminated', 'migratory', 'notarized',
+  'osmotic', 'pneumatic', 'quarantined', 'retractable', 'sublimated',
+  'thermonuclear', 'unrefrigerated', 'ventilated', 'weatherproof', 'zero-emission',
+  'spring-loaded', 'cross-pollinated', 'non-euclidean', 'overclocked', 'double-jointed',
+  'free-range', 'hand-cranked', 'triple-distilled', 'vacuum-sealed', 'weight-bearing',
 ];
 
 const CHAOS_DOMAINS = [
   'maritime law', 'interpretive dance', 'mycology', 'competitive origami',
-  'alpine yodeling', 'submarine cartography', 'artisanal pickle-making',
-  'zero-gravity pottery', 'forensic accounting', 'tropical dentistry',
-  'underground jazz', 'medieval plumbing', 'quantum gardening',
+  'alpine yodeling', 'submarine cartography', 'zero-gravity pottery',
+  'forensic accounting', 'tropical dentistry', 'medieval plumbing',
   'professional napping', 'industrial karaoke', 'deep-sea HR',
-  'orbital sandwich engineering', 'neo-classical debugging',
-  'high-altitude baking', 'nocturnal procurement', 'Antarctic UX research',
-  'competitive whispering', 'sustainable trebuchet design', 'ceremonial load testing',
+  'neo-classical debugging', 'high-altitude baking', 'nocturnal procurement',
+  'Antarctic UX research', 'competitive whispering', 'ceremonial load testing',
   'intergalactic compliance', 'reverse archaeology', 'hydroponic team building',
+  'volcanic hospitality', 'subaquatic real estate', 'competitive calligraphy',
+  'municipal yodeling', 'precision dishwashing', 'speculative entomology',
+  'theoretical laundry', 'underground meteorology', 'freelance volcanology',
+  'arctic interior design', 'molecular gastro-diplomacy', 'tectonic event planning',
+  'interplanetary customs enforcement', 'nocturnal ornithology', 'tactical origami',
+  'high-frequency bird watching', 'geriatric parkour', 'quantum haberdashery',
+  'ceremonial spreadsheet design', 'artisan cloud migration', 'vintage data mining',
+  'extreme librarianship', 'competitive tax preparation', 'guerrilla horticulture',
+  'ambient procurement', 'pastoral network engineering', 'clandestine pottery',
+  'acoustic dermatology', 'orbital beekeeping', 'nautical feng shui',
+  'cryogenic HR management', 'parallel universe logistics', 'microbial sociology',
 ];
 
 function pickRandom<T>(arr: T[], n: number): T[] {
@@ -547,14 +584,27 @@ const HEDGE_WORDS = [
   'Apocryphally', 'Debatably', 'Unconfirmed', 'Implausibly',
 ];
 
+const CHAOS_VIBES = [
+  'unhinged TED talk', 'corporate fever dream', 'dystopian product launch',
+  'motivational cult meeting', 'academic paper gone wrong', 'conspiracy theory keynote',
+  'infomercial from another dimension', 'nature documentary about office life',
+  'cooking show that went off the rails', 'startup pitch from the year 3000',
+  'passive-aggressive town hall', 'budget meeting that became a confession',
+  'after-hours engineering rant', 'HR seminar from a parallel universe',
+  'exit interview disguised as a keynote', 'internal memo read aloud dramatically',
+  'quarterly review conducted as a seance', 'compliance training written by poets',
+  'standup meeting that lasted three days', 'onboarding for a job that does not exist',
+];
+
 function generateChaosSeed(): string {
   const nouns = pickRandom(CHAOS_NOUNS, 4);
   const adjs = pickRandom(CHAOS_ADJECTIVES, 3);
   const domains = pickRandom(CHAOS_DOMAINS, 2);
-  return `CHAOS SEED (use these as creative fuel for THIS deck — weave them into titles, tangents, and themes. Do NOT use them literally as slide titles — transform and combine them):
+  const vibe = pickRandom(CHAOS_VIBES, 1)[0];
+  return `CHAOS SEED — use these ONLY as background inspiration. Do NOT make any seed word a recurring theme. Use each word AT MOST once across all slides, then move on. The deck should feel varied, not themed around any single word.
 Words: ${nouns.join(', ')}, ${adjs.join(', ')}
-Domains to riff on: ${domains.join(', ')}
-Vibe: ${pickRandom(['unhinged TED talk', 'corporate fever dream', 'dystopian product launch', 'motivational cult meeting', 'academic paper gone wrong', 'conspiracy theory keynote', 'infomercial from another dimension', 'nature documentary about office life', 'cooking show that went off the rails', 'startup pitch from the year 3000'], 1)[0]}`;
+Domains: ${domains.join(', ')}
+Vibe: ${vibe}`;
 }
 
 function generateQuoteRoster(): string {
