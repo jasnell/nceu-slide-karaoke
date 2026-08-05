@@ -10,18 +10,28 @@ interface Env {
   PIXABAY_API_KEY?: string;
 }
 
+interface ChartDataPoint {
+  label: string;
+  value: number;
+}
+
 interface Slide {
   title: string;
   subtitle: string;
   quote: string;
+  chartData: ChartDataPoint[] | null;
+  audience: boolean;
   imageQuery: string;
   imageUrl: string;
   notes: string;
 }
 
+type Difficulty = 'easy' | 'medium' | 'hard';
+
 interface Presentation {
   title: string;
   slides: Slide[];
+  difficulty: Difficulty;
 }
 
 interface StoredPresentation extends Presentation {
@@ -34,8 +44,15 @@ interface RecentEntry {
   id: string;
   title: string;
   prompt: string;
+  difficulty: Difficulty;
   createdAt: string;
 }
+
+const DIFFICULTY_CONFIG: Record<Difficulty, { slides: number; timer: number; description: string }> = {
+  easy:   { slides: 8,  timer: 5 * 60, description: 'stays closer to the topic, fewer curveballs' },
+  medium: { slides: 10, timer: 5 * 60, description: 'the classic experience — absurd but survivable' },
+  hard:   { slides: 15, timer: 5 * 60, description: 'maximum chaos, every slide is a trap, quotes everywhere' },
+};
 
 const MAX_RECENT = 10;
 const DECK_TTL = 60 * 60 * 24 * 7; // 7 days
@@ -44,26 +61,17 @@ const DECK_TTL = 60 * 60 * 24 * 7; // 7 days
 // AI SYSTEM PROMPT
 // ================================================================
 
-const SYSTEM_PROMPT = `You generate slide decks for Slide Karaoke — a party game at a tech conference where a player must stand on stage and improvise a five-minute talk using slides they have NEVER seen before. The audience is watching. There is no escape.
+const BASE_PROMPT = `You generate slide decks for Slide Karaoke — a party game at a tech conference where a player must stand on stage and improvise a five-minute talk using slides they have NEVER seen before. The audience is watching. There is no escape.
 
 Your sole purpose is to make the presenter's life as hilariously difficult as possible. The slides must look superficially like a real conference talk but be ABSOLUTE NONSENSE underneath.
 
-HARD RULES:
-1. EXACTLY 10 slides.
-2. Slide titles: 1–5 words MAX, displayed in enormous text.
-3. Subtitles: most slides should have NO subtitle (empty string). When used, max 6 words, and it should CONTRADICT or DERAIL the title.
-4. Image search terms must produce a stock photo that has ZERO logical connection to the slide.
-5. Speaker notes: max 15 words. Deadpan confident gibberish.
-6. Slide 1 is a title slide. Slides 2–9 escalate in absurdity. Slide 10 is a bizarre call to action.
-7. Strictly safe for work. No innuendo, nothing political, nothing mean-spirited.
+Strictly safe for work. No innuendo, nothing political, nothing mean-spirited.
 
 CREATIVITY — CRITICAL:
 You will receive a "chaos seed" with each request containing random words. Use these words as creative fuel — weave them into your titles, themes, and tangents. This ensures every deck is wildly different.
 
 EVERY DECK MUST BE UNIQUE. Never reuse the same absurd nouns, adjectives, or themes across decks. The universe of absurdity is infinite — draw from ALL of it:
-- Animals (but not always the same ones — there are thousands of species beyond cats, dogs, and penguins)
-- Foods (the world has thousands of dishes, ingredients, textures — use obscure ones)
-- Professions, hobbies, historical events, geography, furniture, weather, emotions, textures, sounds, smells, scientific concepts, musical instruments, sports, fabrics, minerals, kitchen appliances, maritime terminology, botanical terms, architectural styles, dance moves...
+- Animals, foods, professions, hobbies, historical events, geography, furniture, weather, emotions, textures, sounds, smells, scientific concepts, musical instruments, sports, fabrics, minerals, kitchen appliances, maritime terminology, botanical terms, architectural styles, dance moves...
 - The absurdity should come from UNEXPECTED COMBINATIONS, not from a fixed list of "funny words"
 
 SLIDE STRUCTURE PATTERNS (vary which you use — never use all in one deck):
@@ -74,17 +82,42 @@ SLIDE STRUCTURE PATTERNS (vary which you use — never use all in one deck):
 - A title that sounds like a chapter from a book that should not exist.
 - A countdown or "phase" that implies a terrifying plan.
 - A title that is a complete sentence but makes no sense.
-- By slide 5, the talk should have drifted into completely unrelated territory. Do not acknowledge it.
 
-FAKE QUOTES (on 2–3 slides, never slide 1):
-Misattributed nonsense from Node.js contributors. The quote must be SHORT (under 12 words), punchy, and sound vaguely profound while meaning nothing. Attribution format: text -- Person Name, Hedgeword (no quotation marks in the JSON value — the frontend adds them).
+Some slides can be CHART slides — set the "chartData" field with data for a fake bar, pie, or line chart with absurd labels and values. Keep to 3-6 data points. Use this for 1-2 slides max. On chart slides, the chart IS the visual — still set imageQuery for a fallback but the chart will overlay it.
 
-Vary the tone across quotes: absurdly technical, faux-philosophical, deadpan practical, ominous warning, or surreal non-sequitur. Use ONLY the people and hedge words provided in the QUOTE ROSTER below — they are shuffled per request. Pick from the TOP of each list so you get different people every time.
+Some slides can be AUDIENCE PARTICIPATION slides — set "audience" to true. These display differently (big centered text, call-to-action styling). Use for 0-1 slides per deck.
 
-IMAGE SEARCH TERMS: Must have ZERO connection to the slide. Use SPECIFIC, vivid, findable terms — a person doing something, an animal in an unexpected place, a strange object. NEVER repeat image terms across slides. NEVER use generic terms like "abstract" or "technology".
+FAKE QUOTES: Use ONLY the people and hedge words provided in the QUOTE ROSTER. Attribution format: text -- Person Name, Hedgeword (no quotation marks in the JSON — the frontend adds them). Vary tone: technical, philosophical, practical, ominous, or surreal.
 
-Output ONLY valid JSON:
-{"title":"Presentation title","slides":[{"title":"Title","subtitle":"","quote":"","imageQuery":"specific photo","notes":"short nonsense"}]}`;
+IMAGE SEARCH TERMS: Must have ZERO connection to the slide. Use SPECIFIC, vivid, findable terms. NEVER generic terms like "abstract" or "technology".`;
+
+const DIFFICULTY_PROMPTS: Record<Difficulty, string> = {
+  easy: `DIFFICULTY: EASY
+Generate EXACTLY 8 slides. Slide titles: 1–5 words. Subtitles: most empty, max 6 words when used.
+The presentation should stay LOOSELY connected to the original topic throughout — the humor comes from odd angles and strange takes, not total derailment. Still absurd, but the presenter can find a thread to follow.
+Quotes on 1–2 slides (never slide 1). No chart slides. No audience participation slides.
+Speaker notes: max 15 words, mildly helpful but strange.
+Slide 1 is a title slide. Last slide is a slightly odd conclusion.`,
+
+  medium: `DIFFICULTY: MEDIUM
+Generate EXACTLY 10 slides. Slide titles: 1–5 words. Subtitles: most empty, max 6 words when used, should CONTRADICT or DERAIL the title.
+By slide 5, the talk should have drifted into unrelated territory. Do not acknowledge the drift.
+Quotes on 2–3 slides (never slide 1). 1 chart slide with absurd data. 0–1 audience participation slides.
+Speaker notes: max 15 words, deadpan confident gibberish.
+Slide 1 is a title slide. Last slide is a bizarre call to action.`,
+
+  hard: `DIFFICULTY: HARD — MAXIMUM CHAOS
+Generate EXACTLY 15 slides. Slide titles: 1–5 words. Subtitles: use more often, always contradicting or derailing the title.
+The presentation should abandon the topic by slide 3 and NEVER return. Each slide should feel like it belongs to a different presentation. The presenter should have NO idea what is happening.
+Quotes on 4–5 slides (never slide 1) — make them increasingly unhinged. 1–2 chart slides with completely fabricated data. 1–2 audience participation slides with impossible requests.
+Speaker notes: max 15 words, actively misleading.
+Slide 1 is a title slide. Last slide should be a threat disguised as a thank-you.`,
+};
+
+function buildSystemPrompt(difficulty: Difficulty): string {
+  return BASE_PROMPT + '\n\n' + DIFFICULTY_PROMPTS[difficulty] + `\n\nOutput ONLY valid JSON:
+{"title":"Title","slides":[{"title":"T","subtitle":"","quote":"","chartData":null,"audience":false,"imageQuery":"photo","notes":"nonsense"}]}`;
+}
 
 // ================================================================
 // HELPERS
@@ -222,7 +255,7 @@ async function saveDeck(env: Env, prompt: string, presentation: Presentation): P
   // Update the recent list
   const recentRaw = await env.DECKS.get('recent');
   let recent: RecentEntry[] = recentRaw ? JSON.parse(recentRaw) : [];
-  recent.unshift({ id, title: presentation.title, prompt, createdAt: stored.createdAt });
+  recent.unshift({ id, title: presentation.title, prompt, difficulty: presentation.difficulty || 'medium', createdAt: stored.createdAt });
   recent = recent.slice(0, MAX_RECENT);
   await env.DECKS.put('recent', JSON.stringify(recent));
 
@@ -451,22 +484,23 @@ async function moderatePrompt(env: Env, prompt: string): Promise<{ safe: boolean
   return { safe: true };
 }
 
-async function generatePresentation(env: Env, prompt: string): Promise<Presentation> {
+async function generatePresentation(env: Env, prompt: string, difficulty: Difficulty = 'medium'): Promise<Presentation> {
   const chaosSeed = generateChaosSeed();
   const quoteRoster = generateQuoteRoster();
+  const systemPrompt = buildSystemPrompt(difficulty);
 
   const aiResponse = await env.AI.run(
     '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
     {
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: systemPrompt },
         {
           role: 'user',
           content: `Create an absurdist presentation about: ${prompt}\n\n${chaosSeed}\n\n${quoteRoster}\n\nRespond with ONLY the JSON object, no other text.`,
         },
       ],
       max_tokens: 8192,
-      temperature: 0.9,
+      temperature: difficulty === 'hard' ? 0.95 : 0.9,
     }
   );
 
@@ -512,10 +546,13 @@ async function generatePresentation(env: Env, prompt: string): Promise<Presentat
     title: slide.title || 'Untitled',
     subtitle: slide.subtitle || '',
     quote: slide.quote || '',
+    chartData: Array.isArray(slide.chartData) ? slide.chartData : null,
+    audience: !!slide.audience,
     imageQuery: slide.imageQuery || 'random object',
     imageUrl: '',
     notes: slide.notes || '',
   }));
+  presentation.difficulty = difficulty;
 
   // Fetch images in parallel
   const imageUrls = await Promise.all(
@@ -819,6 +856,58 @@ a { color: inherit; }
   font-size: 0.65rem;
 }
 
+/* ---- DIFFICULTY SELECTOR ---- */
+.difficulty-selector {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+}
+
+.diff-btn {
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.6rem 0.5rem 0.5rem;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.diff-btn:hover { border-color: var(--accent); color: var(--ink); }
+.diff-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.diff-desc {
+  display: block;
+  font-size: 0.58rem;
+  font-weight: 400;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-top: 0.2rem;
+}
+.diff-btn.active .diff-desc { color: var(--accent); }
+
+.presenter-input {
+  border: 1px solid var(--rule);
+  background: var(--surface-elevated);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 0.92rem;
+  padding: 0.6rem 1rem;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.presenter-input::placeholder { color: var(--muted); }
+.presenter-input:focus { border-color: var(--accent); }
+
 .suggestions {
   display: flex;
   flex-wrap: wrap;
@@ -938,6 +1027,14 @@ a { color: inherit; }
   color: var(--accent);
 }
 
+.ready-presenter {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 48, "SOFT" 100, "WONK" 1;
+  font-size: 1.2rem;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+
 .ready-hint {
   font-family: var(--mono);
   font-size: 0.68rem;
@@ -1009,6 +1106,18 @@ a { color: inherit; }
   color: rgba(255,255,255,0.7);
   text-shadow: 0 1px 10px rgba(0,0,0,0.4);
   margin: 0.4rem 0 0;
+}
+
+.slide-presenter {
+  font-family: var(--body);
+  font-size: clamp(0.85rem, 2vw, 1.1rem);
+  font-weight: 300;
+  color: var(--accent);
+  text-shadow: 0 1px 8px rgba(0,0,0,0.5);
+  margin: 0.8rem 0 0;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  display: none;
 }
 
 /* ---- QUOTE OVERLAY ---- */
@@ -1112,6 +1221,124 @@ a { color: inherit; }
 
 [data-contributor="belanger"] .slide-quote-text { font-variation-settings: "opsz" 144, "SOFT" 50, "WONK" 1; font-size: clamp(2rem, 5vw, 3.8rem); font-weight: 300; }
 
+/* ---- CHART OVERLAY ---- */
+.slide-chart-container {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+.slide-chart-container.visible { opacity: 1; }
+
+.slide-chart-inner {
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.12);
+  padding: 2rem 2.5rem 1.5rem;
+  min-width: 50%;
+  max-width: 80%;
+}
+
+.chart-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: clamp(0.8rem, 2vw, 1.5rem);
+  height: clamp(10rem, 30vh, 18rem);
+  padding-bottom: 0.5rem;
+}
+
+.chart-bar-group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  height: 100%;
+  justify-content: flex-end;
+}
+
+.chart-bar {
+  width: 100%;
+  max-width: 5rem;
+  min-height: 4px;
+  background: var(--accent);
+  border: 1px solid rgba(255,255,255,0.2);
+  transition: height 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.chart-bar-group:nth-child(2n) .chart-bar { background: #ffd166; }
+.chart-bar-group:nth-child(3n) .chart-bar { background: #ef476f; }
+.chart-bar-group:nth-child(5n) .chart-bar { background: #7df9ff; }
+
+.chart-value {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: rgba(255,255,255,0.7);
+  letter-spacing: 0.04em;
+}
+
+.chart-label {
+  font-family: var(--mono);
+  font-size: clamp(0.58rem, 1.2vw, 0.72rem);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.6);
+  text-align: center;
+  max-width: 8rem;
+  word-break: break-word;
+}
+
+/* ---- AUDIENCE PARTICIPATION ---- */
+.slide-audience-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+.slide-audience-overlay.visible { opacity: 1; }
+
+.slide-audience-inner {
+  text-align: center;
+  max-width: 80%;
+  animation: audience-pulse 2s ease-in-out infinite;
+}
+
+@keyframes audience-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.03); }
+}
+
+.slide-audience-label {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+
+.slide-audience-text {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "SOFT" 50, "WONK" 0;
+  font-size: clamp(2rem, 6vw, 4.5rem);
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 2px 20px rgba(0,0,0,0.5);
+  text-wrap: balance;
+}
+
 .slide-chrome {
   position: absolute;
   bottom: 0;
@@ -1139,6 +1366,36 @@ a { color: inherit; }
   transition: opacity 0.3s;
 }
 .slide-container:hover .slide-hints { color: rgba(255,255,255,0.5); }
+
+/* ---- TIMER ---- */
+.slide-timer {
+  position: absolute;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--mono);
+  font-size: 1.4rem;
+  letter-spacing: 0.06em;
+  color: rgba(255,255,255,0.7);
+  background: rgba(0,0,0,0.5);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 0.4rem 1rem;
+  border: 1px solid rgba(255,255,255,0.1);
+  z-index: 8;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s;
+  user-select: none;
+}
+.slide-timer.visible { opacity: 1; }
+.slide-timer.warning { color: #ffd166; border-color: rgba(255,209,102,0.3); }
+.slide-timer.danger  { color: #ef476f; border-color: rgba(239,71,111,0.3); animation: timer-pulse 1s ease-in-out infinite; }
+
+@keyframes timer-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
 
 .slide-notes-overlay {
   position: absolute;
@@ -1384,6 +1641,19 @@ a { color: inherit; }
             Random
           </button>
         </div>
+        <div class="difficulty-selector" id="difficulty-selector">
+          <button type="button" class="diff-btn" data-diff="easy">Easy<span class="diff-desc">8 slides, survivable</span></button>
+          <button type="button" class="diff-btn active" data-diff="medium">Medium<span class="diff-desc">10 slides, absurd</span></button>
+          <button type="button" class="diff-btn" data-diff="hard">Hard<span class="diff-desc">15 slides, unhinged</span></button>
+        </div>
+        <input
+          type="text"
+          id="presenter-input"
+          class="presenter-input"
+          placeholder="Presenter name (optional)"
+          maxlength="60"
+          autocomplete="off"
+        >
         <button type="submit" id="submit-btn" class="button button-primary">
           <span class="hex-icon">&#x25C6;</span> Generate Slides
         </button>
@@ -1425,6 +1695,7 @@ a { color: inherit; }
     <p class="kicker">Ready to present</p>
     <h1 id="ready-title"></h1>
     <p class="ready-info"><span id="ready-count"></span> slides of pure absurdity</p>
+    <p class="ready-presenter" id="ready-presenter"></p>
     <div class="share-row" id="share-row">
       <span class="share-url" id="share-url"></span>
       <button class="copy-btn" id="copy-btn" type="button">Copy Link</button>
@@ -1445,6 +1716,7 @@ a { color: inherit; }
     <div class="slide-content fade-content" id="slide-text-content">
       <h2 class="slide-title" id="slide-title"></h2>
       <p class="slide-subtitle" id="slide-subtitle"></p>
+      <p class="slide-presenter" id="slide-presenter"></p>
     </div>
     <div class="slide-quote-container fade-content" id="slide-quote-container">
       <div class="slide-quote-inner" id="slide-quote-inner">
@@ -1452,9 +1724,21 @@ a { color: inherit; }
         <cite class="slide-quote-attr" id="slide-quote-attr"></cite>
       </div>
     </div>
+    <div class="slide-chart-container" id="slide-chart-container">
+      <div class="slide-chart-inner">
+        <div class="chart-bars" id="chart-bars"></div>
+      </div>
+    </div>
+    <div class="slide-audience-overlay" id="slide-audience-overlay">
+      <div class="slide-audience-inner">
+        <p class="slide-audience-label">Audience Participation</p>
+        <p class="slide-audience-text" id="slide-audience-text"></p>
+      </div>
+    </div>
+    <div class="slide-timer" id="slide-timer">5:00</div>
     <div class="slide-chrome">
       <span class="slide-counter" id="slide-counter"></span>
-      <span class="slide-hints" id="slide-hints">&#8592; &#8594; navigate &middot; ESC exit &middot; N notes</span>
+      <span class="slide-hints" id="slide-hints">&#8592; &#8594; navigate &middot; ESC exit &middot; N notes &middot; T timer</span>
     </div>
     <div class="slide-notes-overlay" id="slide-notes">
       <p class="slide-notes-label">Speaker Notes</p>
@@ -1493,6 +1777,8 @@ a { color: inherit; }
   var presentation = null;
   var currentSlide = 0;
   var notesVisible = false;
+  var selectedDifficulty = 'medium';
+  var presenterName = '';
 
   // ---- Random topics ----
   var TOPICS = [
@@ -1537,10 +1823,12 @@ a { color: inherit; }
     form:           document.getElementById('generate-form'),
     input:          document.getElementById('prompt-input'),
     submitBtn:      document.getElementById('submit-btn'),
+    presenterInput: document.getElementById('presenter-input'),
     randomBtn:      document.getElementById('random-btn'),
     loadingStatus:  document.getElementById('loading-status'),
     readyTitle:     document.getElementById('ready-title'),
     readyCount:     document.getElementById('ready-count'),
+    readyPresenter: document.getElementById('ready-presenter'),
     shareRow:       document.getElementById('share-row'),
     shareUrl:       document.getElementById('share-url'),
     copyBtn:        document.getElementById('copy-btn'),
@@ -1548,6 +1836,7 @@ a { color: inherit; }
     slideBg:        document.getElementById('slide-bg'),
     slideTitle:     document.getElementById('slide-title'),
     slideSubtitle:  document.getElementById('slide-subtitle'),
+    slidePresenter: document.getElementById('slide-presenter'),
     slideQuoteContainer: document.getElementById('slide-quote-container'),
     slideQuoteInner: document.getElementById('slide-quote-inner'),
     slideQuoteText: document.getElementById('slide-quote-text'),
@@ -1556,6 +1845,11 @@ a { color: inherit; }
     slideProgress:  document.getElementById('slide-progress'),
     slideTextContent: document.getElementById('slide-text-content'),
     slideNotes:     document.getElementById('slide-notes'),
+    slideTimer:     document.getElementById('slide-timer'),
+    chartContainer: document.getElementById('slide-chart-container'),
+    chartBars:      document.getElementById('chart-bars'),
+    audienceOverlay: document.getElementById('slide-audience-overlay'),
+    audienceText:   document.getElementById('slide-audience-text'),
     notesText:      document.getElementById('notes-text'),
     finTitle:       document.getElementById('fin-title'),
     newBtn:         document.getElementById('new-btn'),
@@ -1648,11 +1942,16 @@ a { color: inherit; }
   function showReadyScreen() {
     els.readyTitle.textContent = presentation.title;
     els.readyCount.textContent = presentation.slides.length;
+    if (presenterName) {
+      els.readyPresenter.textContent = 'Presented by ' + presenterName;
+      els.readyPresenter.style.display = 'block';
+    } else {
+      els.readyPresenter.style.display = 'none';
+    }
     if (presentation.id) {
       var link = location.origin + '/p/' + presentation.id;
       els.shareUrl.textContent = link;
       els.shareRow.style.display = 'flex';
-      // Update URL without reload
       history.replaceState(null, '', '/p/' + presentation.id);
     } else {
       els.shareRow.style.display = 'none';
@@ -1662,6 +1961,7 @@ a { color: inherit; }
 
   // ---- Generate presentation ----
   async function generate(prompt) {
+    presenterName = (els.presenterInput.value || '').trim();
     showView('loading');
     els.loadingStatus.textContent = 'Asking the AI for something truly unhinged';
 
@@ -1682,7 +1982,7 @@ a { color: inherit; }
       var resp = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: prompt }),
+        body: JSON.stringify({ prompt: prompt, difficulty: selectedDifficulty }),
       });
 
       clearInterval(msgInterval);
@@ -1753,9 +2053,11 @@ a { color: inherit; }
     var slide = presentation.slides[index];
     currentSlide = index;
 
-    // Fade out text
+    // Fade out everything
     els.slideTextContent.classList.add('fading');
     els.slideQuoteContainer.classList.remove('visible');
+    els.chartContainer.classList.remove('visible');
+    els.audienceOverlay.classList.remove('visible');
 
     // Load background
     var bg = els.slideBg;
@@ -1776,24 +2078,51 @@ a { color: inherit; }
       els.slideTitle.textContent = slide.title;
       els.slideSubtitle.textContent = slide.subtitle || '';
       els.slideSubtitle.style.display = slide.subtitle ? 'block' : 'none';
-      // Quote handling — split text from attribution, determine contributor style
+
+      // Show presenter name on title slide only
+      if (index === 0 && presenterName) {
+        els.slidePresenter.textContent = presenterName;
+        els.slidePresenter.style.display = 'block';
+      } else {
+        els.slidePresenter.style.display = 'none';
+      }
+
+      // Quote
       var rawQuote = (slide.quote || '').trim();
       if (rawQuote) {
         var dashMatch = rawQuote.match(/^([\s\S]+?)\s*(?:--|—|–)\s*([\s\S]+)$/);
         if (dashMatch) {
           els.slideQuoteText.textContent = dashMatch[1].replace(/^["'\u201C]+|["'\u201D]+$/g, '').trim();
-          els.slideQuoteAttr.textContent = '— ' + dashMatch[2].trim();
+          els.slideQuoteAttr.textContent = '\u2014 ' + dashMatch[2].trim();
         } else {
           els.slideQuoteText.textContent = rawQuote;
           els.slideQuoteAttr.textContent = '';
         }
-        // Determine contributor key for styling
         var contribKey = getContributorKey(rawQuote);
         els.slideQuoteInner.setAttribute('data-contributor', contribKey);
         els.slideQuoteContainer.classList.add('visible');
-      } else {
-        els.slideQuoteContainer.classList.remove('visible');
       }
+
+      // Chart
+      if (slide.chartData && slide.chartData.length > 0) {
+        var maxVal = Math.max.apply(null, slide.chartData.map(function(d) { return Math.abs(d.value); }));
+        els.chartBars.innerHTML = slide.chartData.map(function(d) {
+          var pct = maxVal > 0 ? (Math.abs(d.value) / maxVal * 100) : 10;
+          return '<div class="chart-bar-group">'
+            + '<span class="chart-value">' + d.value + '</span>'
+            + '<div class="chart-bar" style="height:' + Math.max(pct, 4) + '%"></div>'
+            + '<span class="chart-label">' + escHtml(d.label) + '</span>'
+            + '</div>';
+        }).join('');
+        els.chartContainer.classList.add('visible');
+      }
+
+      // Audience participation
+      if (slide.audience) {
+        els.audienceText.textContent = slide.title;
+        els.audienceOverlay.classList.add('visible');
+      }
+
       els.slideCounter.textContent = (index + 1) + ' / ' + presentation.slides.length;
       els.slideProgress.style.width = ((index + 1) / presentation.slides.length * 100) + '%';
       els.notesText.textContent = slide.notes || '';
@@ -1830,6 +2159,7 @@ a { color: inherit; }
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(function() {});
     }
+    resetTimer();
     history.replaceState(null, '', '/');
     showView('landing');
     presentation = null;
@@ -1839,6 +2169,70 @@ a { color: inherit; }
     notesVisible = !notesVisible;
     els.slideNotes.classList.toggle('visible', notesVisible);
   }
+
+  // ---- Timer ----
+  var timerVisible = false;
+  var timerRunning = false;
+  var timerSeconds = 0;
+  var timerInterval = null;
+
+  function formatTime(secs) {
+    var m = Math.floor(secs / 60);
+    var s = secs % 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  function updateTimerDisplay() {
+    els.slideTimer.textContent = formatTime(timerSeconds);
+    els.slideTimer.classList.remove('warning', 'danger');
+    if (timerSeconds <= 30) els.slideTimer.classList.add('danger');
+    else if (timerSeconds <= 60) els.slideTimer.classList.add('warning');
+  }
+
+  function startTimer(durationSeconds) {
+    stopTimer();
+    timerSeconds = durationSeconds;
+    updateTimerDisplay();
+    timerRunning = true;
+    timerInterval = setInterval(function() {
+      if (timerSeconds > 0) {
+        timerSeconds--;
+        updateTimerDisplay();
+      } else {
+        stopTimer();
+        els.slideTimer.textContent = '0:00';
+        els.slideTimer.classList.add('danger');
+      }
+    }, 1000);
+  }
+
+  function stopTimer() {
+    timerRunning = false;
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  }
+
+  function toggleTimer() {
+    timerVisible = !timerVisible;
+    els.slideTimer.classList.toggle('visible', timerVisible);
+    if (timerVisible && !timerRunning) {
+      startTimer(5 * 60);
+    }
+  }
+
+  function resetTimer() {
+    stopTimer();
+    timerVisible = false;
+    els.slideTimer.classList.remove('visible', 'warning', 'danger');
+  }
+
+  // ---- Difficulty selector ----
+  document.querySelectorAll('.diff-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.diff-btn').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      selectedDifficulty = btn.getAttribute('data-diff') || 'medium';
+    });
+  });
 
   // ---- Event listeners ----
   els.form.addEventListener('submit', function(e) {
@@ -1933,6 +2327,8 @@ a { color: inherit; }
           e.preventDefault(); exitPresentation(); break;
         case 'n': case 'N':
           e.preventDefault(); toggleNotes(); break;
+        case 't': case 'T':
+          e.preventDefault(); toggleTimer(); break;
       }
     } else if (activeView === 'ready') {
       if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); startPresentation(); }
@@ -2026,8 +2422,9 @@ export default {
           );
         }
 
-        const body = await request.json() as { prompt?: string };
+        const body = await request.json() as { prompt?: string; difficulty?: string };
         const prompt = body.prompt?.trim();
+        const difficulty: Difficulty = (body.difficulty === 'easy' || body.difficulty === 'hard') ? body.difficulty : 'medium';
 
         if (!prompt) {
           return Response.json(
@@ -2052,7 +2449,7 @@ export default {
           );
         }
 
-        const presentation = await generatePresentation(env, prompt);
+        const presentation = await generatePresentation(env, prompt, difficulty);
 
         // Save to KV and return the stored version (includes id)
         const stored = await saveDeck(env, prompt, presentation);
