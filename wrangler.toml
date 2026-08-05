@@ -1,0 +1,25 @@
+name = "slide-karaoke"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "DECKS"
+id = "77812cfedf81402391e11563dc676308"
+# For local dev wrangler creates a local KV automatically.
+# Before deploying, create the real namespace:
+#   npx wrangler kv namespace create DECKS
+# then paste the returned id above.
+
+# --- Image API keys (set one or both for keyword-matched photos) ---
+# Each slide randomly picks a source for visual variety.
+# Without any keys, slides fall back to random Lorem Picsum photos.
+#
+# Pexels  — clean stock photos         https://www.pexels.com/api/
+#   npx wrangler secret put PEXELS_API_KEY
+#
+# Pixabay — widest variety, niche content, illustrations
+#                                      https://pixabay.com/api/docs/
+#   npx wrangler secret put PIXABAY_API_KEY

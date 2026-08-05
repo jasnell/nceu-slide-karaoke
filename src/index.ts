@@ -1,0 +1,2051 @@
+// ================================================================
+// Slide Karaoke — for NodeConf EU 2026
+// Powered by Cloudflare Workers AI
+// ================================================================
+
+interface Env {
+  AI: Ai;
+  DECKS: KVNamespace;
+  PEXELS_API_KEY?: string;
+  PIXABAY_API_KEY?: string;
+}
+
+interface Slide {
+  title: string;
+  subtitle: string;
+  quote: string;
+  imageQuery: string;
+  imageUrl: string;
+  notes: string;
+}
+
+interface Presentation {
+  title: string;
+  slides: Slide[];
+}
+
+interface StoredPresentation extends Presentation {
+  id: string;
+  prompt: string;
+  createdAt: string;
+}
+
+interface RecentEntry {
+  id: string;
+  title: string;
+  prompt: string;
+  createdAt: string;
+}
+
+const MAX_RECENT = 10;
+const DECK_TTL = 60 * 60 * 24 * 7; // 7 days
+
+// ================================================================
+// AI SYSTEM PROMPT
+// ================================================================
+
+const SYSTEM_PROMPT = `You generate slide decks for Slide Karaoke — a party game at a tech conference where a player must stand on stage and improvise a five-minute talk using slides they have NEVER seen before. The audience is watching. There is no escape.
+
+Your sole purpose is to make the presenter's life as hilariously difficult as possible. The slides must look superficially like a real conference talk but be ABSOLUTE NONSENSE underneath.
+
+HARD RULES:
+1. EXACTLY 10 slides.
+2. Slide titles: 1–5 words MAX, displayed in enormous text.
+3. Subtitles: most slides should have NO subtitle (empty string). When used, max 6 words, and it should CONTRADICT or DERAIL the title.
+4. Image search terms must produce a stock photo that has ZERO logical connection to the slide.
+5. Speaker notes: max 15 words. Deadpan confident gibberish.
+6. Slide 1 is a title slide. Slides 2–9 escalate in absurdity. Slide 10 is a bizarre call to action.
+7. Strictly safe for work. No innuendo, nothing political, nothing mean-spirited.
+
+CREATIVITY — CRITICAL:
+You will receive a "chaos seed" with each request containing random words. Use these words as creative fuel — weave them into your titles, themes, and tangents. This ensures every deck is wildly different.
+
+EVERY DECK MUST BE UNIQUE. Never reuse the same absurd nouns, adjectives, or themes across decks. The universe of absurdity is infinite — draw from ALL of it:
+- Animals (but not always the same ones — there are thousands of species beyond cats, dogs, and penguins)
+- Foods (the world has thousands of dishes, ingredients, textures — use obscure ones)
+- Professions, hobbies, historical events, geography, furniture, weather, emotions, textures, sounds, smells, scientific concepts, musical instruments, sports, fabrics, minerals, kitchen appliances, maritime terminology, botanical terms, architectural styles, dance moves...
+- The absurdity should come from UNEXPECTED COMBINATIONS, not from a fixed list of "funny words"
+
+SLIDE STRUCTURE PATTERNS (vary which you use — never use all in one deck):
+- A single ominous word with a period. Pick something nobody expects.
+- A fabricated statistic delivered as gospel. Invent a new one every time.
+- A non-sequitur audience participation moment. Different every time.
+- Corporate jargon mashed with an unrelated domain.
+- A title that sounds like a chapter from a book that should not exist.
+- A countdown or "phase" that implies a terrifying plan.
+- A title that is a complete sentence but makes no sense.
+- By slide 5, the talk should have drifted into completely unrelated territory. Do not acknowledge it.
+
+FAKE QUOTES (on 2–3 slides, never slide 1):
+Misattributed nonsense from Node.js contributors. The quote must be SHORT (under 12 words), punchy, and sound vaguely profound while meaning nothing. Attribution format: text -- Person Name, Hedgeword (no quotation marks in the JSON value — the frontend adds them).
+
+Vary the tone across quotes: absurdly technical, faux-philosophical, deadpan practical, ominous warning, or surreal non-sequitur. Use ONLY the people and hedge words provided in the QUOTE ROSTER below — they are shuffled per request. Pick from the TOP of each list so you get different people every time.
+
+IMAGE SEARCH TERMS: Must have ZERO connection to the slide. Use SPECIFIC, vivid, findable terms — a person doing something, an animal in an unexpected place, a strange object. NEVER repeat image terms across slides. NEVER use generic terms like "abstract" or "technology".
+
+Output ONLY valid JSON:
+{"title":"Presentation title","slides":[{"title":"Title","subtitle":"","quote":"","imageQuery":"specific photo","notes":"short nonsense"}]}`;
+
+// ================================================================
+// HELPERS
+// ================================================================
+
+/** Pull the generated text out of whatever shape the Workers AI binding returns. */
+function extractAIText(aiResponse: unknown): string {
+  if (typeof aiResponse === 'string') return aiResponse;
+  if (!aiResponse || typeof aiResponse !== 'object') return '';
+
+  const obj = aiResponse as Record<string, unknown>;
+
+  // OpenAI-compatible shape: choices[0].message.content (often the longest / most complete)
+  if (Array.isArray(obj.choices) && obj.choices.length > 0) {
+    const choice = obj.choices[0] as Record<string, unknown>;
+    if (choice.message && typeof choice.message === 'object') {
+      const msg = choice.message as Record<string, unknown>;
+      if (typeof msg.content === 'string' && msg.content) return msg.content;
+    }
+  }
+
+  // Simple { response: "..." }
+  if (typeof obj.response === 'string' && obj.response) return obj.response;
+
+  // Other possible fields
+  for (const key of ['text', 'result', 'content', 'generated_text']) {
+    if (typeof obj[key] === 'string' && obj[key]) return obj[key] as string;
+  }
+
+  return '';
+}
+
+/**
+ * If the AI ran out of tokens mid-JSON or produced unescaped quotes,
+ * salvage as many complete slides as possible.
+ */
+function repairTruncatedJSON(raw: string): string {
+  // Strategy: find the last complete slide object (ends with }) that's
+  // followed by , or ] in the slides array, then rebuild valid JSON.
+
+  // Step 1: find the "slides" array start
+  const slidesIdx = raw.indexOf('"slides"');
+  if (slidesIdx === -1) return raw;
+
+  const bracketIdx = raw.indexOf('[', slidesIdx);
+  if (bracketIdx === -1) return raw;
+
+  // Step 2: extract each complete slide by finding balanced {} objects
+  const completeSlides: string[] = [];
+  let i = bracketIdx + 1;
+
+  while (i < raw.length) {
+    // Skip whitespace and commas
+    while (i < raw.length && (raw[i] === ' ' || raw[i] === '\n' || raw[i] === '\r' || raw[i] === '\t' || raw[i] === ',')) i++;
+    if (i >= raw.length || raw[i] !== '{') break;
+
+    // Try to find a balanced {} from position i
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let j = i;
+    for (; j < raw.length; j++) {
+      const ch = raw[j];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\' && inStr) { esc = true; continue; }
+      if (ch === '"' && !esc) { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{') depth++;
+      if (ch === '}') {
+        depth--;
+        if (depth === 0) { j++; break; }
+      }
+    }
+
+    if (depth === 0) {
+      const candidate = raw.slice(i, j);
+      // Validate this slide parses
+      try {
+        JSON.parse(candidate);
+        completeSlides.push(candidate);
+      } catch {
+        // This slide has broken JSON (unescaped quotes etc.) — skip it
+      }
+      i = j;
+    } else {
+      break; // truncated, stop
+    }
+  }
+
+  if (completeSlides.length === 0) return raw; // can't salvage
+
+  // Step 3: extract the title from the prefix
+  const titleMatch = raw.match(/"title"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  const title = titleMatch ? titleMatch[1] : 'Untitled';
+
+  // Step 4: rebuild valid JSON
+  return '{"title":"' + title + '","slides":[' + completeSlides.join(',') + ']}';
+}
+
+function hashString(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function generateId(): string {
+  const chars = 'abcdefghijkmnpqrstuvwxyz23456789'; // no ambiguous chars
+  let id = '';
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  for (const b of bytes) id += chars[b % chars.length];
+  return id;
+}
+
+// ================================================================
+// KV STORAGE
+// ================================================================
+
+async function saveDeck(env: Env, prompt: string, presentation: Presentation): Promise<StoredPresentation> {
+  const id = generateId();
+  const stored: StoredPresentation = {
+    ...presentation,
+    id,
+    prompt,
+    createdAt: new Date().toISOString(),
+  };
+
+  // Save the full deck
+  await env.DECKS.put(`deck:${id}`, JSON.stringify(stored), { expirationTtl: DECK_TTL });
+
+  // Update the recent list
+  const recentRaw = await env.DECKS.get('recent');
+  let recent: RecentEntry[] = recentRaw ? JSON.parse(recentRaw) : [];
+  recent.unshift({ id, title: presentation.title, prompt, createdAt: stored.createdAt });
+  recent = recent.slice(0, MAX_RECENT);
+  await env.DECKS.put('recent', JSON.stringify(recent));
+
+  return stored;
+}
+
+async function getDeck(env: Env, id: string): Promise<StoredPresentation | null> {
+  const raw = await env.DECKS.get(`deck:${id}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function getRecent(env: Env): Promise<RecentEntry[]> {
+  const raw = await env.DECKS.get('recent');
+  return raw ? JSON.parse(raw) : [];
+}
+
+// ================================================================
+// IMAGE FETCHING — multiple sources for variety
+// ================================================================
+
+type ImageSource = 'pexels' | 'pixabay';
+
+/** Pick a URL from a Pexels search. */
+async function fetchFromPexels(apiKey: string, query: string): Promise<string | null> {
+  try {
+    const resp = await fetch(
+      `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=20&orientation=landscape`,
+      { headers: { Authorization: apiKey } }
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json() as { photos?: { src: { large2x?: string; large: string } }[] };
+    if (!data.photos?.length) return null;
+    const photo = data.photos[Math.floor(Math.random() * Math.min(data.photos.length, 15))];
+    return photo.src.large2x || photo.src.large;
+  } catch { return null; }
+}
+
+/** Pick a URL from a Pixabay search. Good for illustrations, weird niche content, animals. */
+async function fetchFromPixabay(apiKey: string, query: string): Promise<string | null> {
+  try {
+    const resp = await fetch(
+      `https://pixabay.com/api/?key=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(query)}&per_page=20&orientation=horizontal&safesearch=true&min_width=1024`,
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json() as { hits?: { largeImageURL: string; webformatURL: string }[] };
+    if (!data.hits?.length) return null;
+    const photo = data.hits[Math.floor(Math.random() * Math.min(data.hits.length, 15))];
+    return photo.largeImageURL || photo.webformatURL;
+  } catch { return null; }
+}
+
+async function fetchImageUrl(env: Env, query: string, index: number): Promise<string> {
+  // Build the list of available sources
+  const sources: { name: ImageSource; fn: () => Promise<string | null> }[] = [];
+  if (env.PEXELS_API_KEY) {
+    sources.push({ name: 'pexels', fn: () => fetchFromPexels(env.PEXELS_API_KEY!, query) });
+  }
+  if (env.PIXABAY_API_KEY) {
+    sources.push({ name: 'pixabay', fn: () => fetchFromPixabay(env.PIXABAY_API_KEY!, query) });
+  }
+
+  if (sources.length > 0) {
+    // Pick a random source for this slide
+    const shuffled = sources.sort(() => Math.random() - 0.5);
+
+    for (const source of shuffled) {
+      const url = await source.fn();
+      if (url) return url;
+      // If the picked source returned nothing for this query, try the next
+    }
+  }
+
+  // Fallback: Lorem Picsum
+  const seed = hashString(query + '-' + index + '-' + Date.now());
+  return `https://picsum.photos/seed/${seed}/1280/720`;
+}
+
+// ================================================================
+// PRESENTATION GENERATION
+// ================================================================
+
+function extractJSON(raw: string): string {
+  // Strip markdown code fences if present
+  let text = raw.trim();
+  const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (fenceMatch) {
+    text = fenceMatch[1].trim();
+  }
+
+  const start = text.indexOf('{');
+  if (start === -1) return '';
+
+  // Return everything from the first { onward — let JSON.parse and
+  // repairTruncatedJSON deal with the details. The old brace-walker
+  // broke on unescaped quotes inside string values, which the AI
+  // produces frequently in the "quote" field.
+  return text.slice(start);
+}
+
+// Word pools for the chaos seed — drawn from wildly different domains
+const CHAOS_NOUNS = [
+  'accordion', 'avalanche', 'barnacle', 'basilisk', 'brisket', 'cardamom', 'centrifuge',
+  'chandelier', 'clementine', 'cobalt', 'corduroy', 'cuttlefish', 'dirigible', 'dolomite',
+  'echidna', 'euphonium', 'feldspar', 'fjord', 'gazpacho', 'gondola', 'harpsichord',
+  'hedgehog', 'heirloom', 'isthmus', 'jackhammer', 'kumquat', 'labyrinth', 'lozenge',
+  'macramé', 'mandolin', 'narwhal', 'nutmeg', 'obsidian', 'origami', 'pangolin',
+  'paprika', 'parsnip', 'pelican', 'periscope', 'phosphorus', 'platypus', 'pomegranate',
+  'porcelain', 'quasar', 'quicksand', 'rhubarb', 'rucksack', 'saffron', 'salamander',
+  'scaffolding', 'sequoia', 'sextant', 'shrapnel', 'sousaphone', 'stalagmite', 'strudel',
+  'sundial', 'tapestry', 'tarantula', 'terracotta', 'thimble', 'toboggan', 'trombone',
+  'tundra', 'turmeric', 'turnstile', 'umbrella', 'velociraptor', 'vermicelli', 'walrus',
+  'wheelbarrow', 'xylophone', 'yak', 'zeppelin', 'anchovy', 'armadillo', 'balustrade',
+  'binoculars', 'burlap', 'cantaloupe', 'carousel', 'catamaran', 'chutney', 'coriander',
+  'croissant', 'dachshund', 'dragonfly', 'duvet', 'easel', 'elderberry', 'flamingo',
+  'funicular', 'gargoyle', 'glockenspiel', 'gymnasium', 'hammock', 'igloo', 'javelin',
+  'kaleidoscope', 'kiln', 'lantern', 'linoleum', 'macaroon', 'mongoose', 'monocle',
+  'nectarine', 'obelisk', 'ottoman', 'parabola', 'pinecone', 'prism', 'quiche',
+  'rampart', 'rutabaga', 'scalpel', 'tobasco', 'trebuchet', 'tugboat', 'turnip',
+  'uvula', 'vestibule', 'waffle', 'yodel', 'zucchini',
+];
+
+const CHAOS_ADJECTIVES = [
+  'translucent', 'carbonated', 'gelatinous', 'magnetic', 'perpendicular', 'fossilized',
+  'turbulent', 'iridescent', 'combustible', 'aerodynamic', 'subterranean', 'invertible',
+  'centrifugal', 'holographic', 'amphibious', 'hydraulic', 'galvanized', 'pressurized',
+  'fermented', 'crystalline', 'buoyant', 'recursive', 'vestigial', 'molten', 'tectonic',
+  'plaid', 'lukewarm', 'wobbling', 'upholstered', 'unlicensed', 'artisanal', 'volatile',
+  'sentient', 'tandem', 'concentric', 'complimentary', 'nomadic', 'load-bearing',
+];
+
+const CHAOS_DOMAINS = [
+  'maritime law', 'interpretive dance', 'mycology', 'competitive origami',
+  'alpine yodeling', 'submarine cartography', 'artisanal pickle-making',
+  'zero-gravity pottery', 'forensic accounting', 'tropical dentistry',
+  'underground jazz', 'medieval plumbing', 'quantum gardening',
+  'professional napping', 'industrial karaoke', 'deep-sea HR',
+  'orbital sandwich engineering', 'neo-classical debugging',
+  'high-altitude baking', 'nocturnal procurement', 'Antarctic UX research',
+  'competitive whispering', 'sustainable trebuchet design', 'ceremonial load testing',
+  'intergalactic compliance', 'reverse archaeology', 'hydroponic team building',
+];
+
+function pickRandom<T>(arr: T[], n: number): T[] {
+  const shuffled = [...arr].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, n);
+}
+
+const CONTRIBUTORS = [
+  'Matteo Collina', 'James M Snell', 'Yagiz Nizipli', 'Michaël Zasso',
+  'Colin Ihrig', 'Robert Nagy', 'Joyee Cheung', 'Paolo Insogna',
+  'Ruy Adorno', 'Myles Borins', 'Anna Henningsen', 'Antoine du Hamel',
+  'Benjamin Gruenbaum', 'Tobias Nießen', 'Richard Lau', 'Chengzhong Wu',
+  'Geoffrey Booth', 'Claudio Wunder', 'Ruben Bridgewater', 'Tierney Cyren',
+  'Danielle Adams', 'Beth Griggs', 'Bryan English', 'Stephen Belanger',
+  'Rafael Gonzaga', 'Marco Ippolito',
+];
+
+const HEDGE_WORDS = [
+  'Probably', 'Likely', 'Allegedly', 'Maybe', 'Reportedly', 'Supposedly',
+  'Possibly', 'Almost Certainly', 'Presumably', 'Unverified', 'Disputed',
+  'Apocryphally', 'Debatably', 'Unconfirmed', 'Implausibly',
+];
+
+function generateChaosSeed(): string {
+  const nouns = pickRandom(CHAOS_NOUNS, 4);
+  const adjs = pickRandom(CHAOS_ADJECTIVES, 3);
+  const domains = pickRandom(CHAOS_DOMAINS, 2);
+  return `CHAOS SEED (use these as creative fuel for THIS deck — weave them into titles, tangents, and themes. Do NOT use them literally as slide titles — transform and combine them):
+Words: ${nouns.join(', ')}, ${adjs.join(', ')}
+Domains to riff on: ${domains.join(', ')}
+Vibe: ${pickRandom(['unhinged TED talk', 'corporate fever dream', 'dystopian product launch', 'motivational cult meeting', 'academic paper gone wrong', 'conspiracy theory keynote', 'infomercial from another dimension', 'nature documentary about office life', 'cooking show that went off the rails', 'startup pitch from the year 3000'], 1)[0]}`;
+}
+
+function generateQuoteRoster(): string {
+  const people = pickRandom(CONTRIBUTORS, CONTRIBUTORS.length); // full shuffle
+  const hedges = pickRandom(HEDGE_WORDS, HEDGE_WORDS.length);
+  return `QUOTE ROSTER (use people from the TOP of this shuffled list — pick 2-3 different ones):
+People: ${people.join(', ')}
+Hedge words: ${hedges.join(', ')}`;
+}
+
+async function generatePresentation(env: Env, prompt: string): Promise<Presentation> {
+  const chaosSeed = generateChaosSeed();
+  const quoteRoster = generateQuoteRoster();
+
+  const aiResponse = await env.AI.run(
+    '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    {
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: `Create an absurdist presentation about: ${prompt}\n\n${chaosSeed}\n\n${quoteRoster}\n\nRespond with ONLY the JSON object, no other text.`,
+        },
+      ],
+      max_tokens: 8192,
+      temperature: 0.9,
+    }
+  );
+
+  // Extract text from whichever field the binding populated
+  const text = extractAIText(aiResponse);
+  console.log('Extracted text length:', text.length);
+
+  if (!text) {
+    console.error('AI response shape:', JSON.stringify(aiResponse).slice(0, 800));
+    throw new Error('AI returned an empty response');
+  }
+
+  // Extract and parse JSON, repairing truncation if needed
+  const jsonStr = extractJSON(text);
+  if (!jsonStr) {
+    console.error('No JSON found in response:', text.slice(0, 1000));
+    throw new Error('AI did not return valid JSON');
+  }
+
+  let presentation: Presentation;
+  try {
+    presentation = JSON.parse(jsonStr);
+  } catch {
+    // The JSON is likely truncated — try to repair it
+    const repaired = repairTruncatedJSON(jsonStr);
+    try {
+      presentation = JSON.parse(repaired);
+      console.log('Parsed after JSON repair, got', presentation.slides?.length, 'slides');
+    } catch {
+      console.error('JSON parse failed even after repair. First 500:', jsonStr.slice(0, 500));
+      throw new Error('Failed to parse AI response as JSON');
+    }
+  }
+
+  // Validate structure
+  if (!presentation.title || !Array.isArray(presentation.slides) || presentation.slides.length === 0) {
+    console.error('Invalid structure:', JSON.stringify(presentation).slice(0, 500));
+    throw new Error('Invalid presentation structure from AI');
+  }
+
+  // Ensure each slide has all required fields
+  presentation.slides = presentation.slides.map(slide => ({
+    title: slide.title || 'Untitled',
+    subtitle: slide.subtitle || '',
+    quote: slide.quote || '',
+    imageQuery: slide.imageQuery || 'random object',
+    imageUrl: '',
+    notes: slide.notes || '',
+  }));
+
+  // Fetch images in parallel
+  const imageUrls = await Promise.all(
+    presentation.slides.map((slide, i) => fetchImageUrl(env, slide.imageQuery, i))
+  );
+
+  presentation.slides.forEach((slide, i) => {
+    slide.imageUrl = imageUrls[i];
+  });
+
+  return presentation;
+}
+
+// ================================================================
+// HTML TEMPLATE
+// ================================================================
+
+const HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slide Karaoke — NodeConf EU 2026</title>
+<link rel="icon" href="https://nodeconf.eu/hexagon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=Hanken+Grotesk:wght@300..900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ---- RESET & BASE ---- */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --paper: #14110c;
+  --paper-deep: #1a1611;
+  --panel: #1c1813;
+  --ink: #f3ecdc;
+  --ink-soft: #b8ae98;
+  --muted: #968c78;
+  --accent: #6ad975;
+  --accent-strong: #6ad975;
+  --accent-dim: #6ad97540;
+  --border: #f3ecdce0;
+  --rule: #f3ecdc38;
+  --surface: #1c1813;
+  --surface-elevated: #211c16;
+  --shadow-hard: 4px 4px 0 0 #f3ecdc;
+  --shadow-hard-sm: 3px 3px 0 0 #f3ecdc;
+
+  --display: "Fraunces", "Times New Roman", serif;
+  --body: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--body);
+  color: var(--ink);
+  background: var(--paper);
+  font-synthesis: none;
+  text-rendering: optimizelegibility;
+  -webkit-font-smoothing: antialiased;
+  line-height: 1.55;
+  overflow: hidden;
+}
+
+body {
+  background:
+    radial-gradient(ellipse at 18% 10%, #39b54a12, transparent 35%),
+    radial-gradient(ellipse at 86% 8%, #39b54a0d, transparent 32%),
+    linear-gradient(180deg, #14110c 0%, #110e09 50%, #0d0b07 100%);
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  opacity: .06;
+  mix-blend-mode: screen;
+  background-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 60 52' width='60' height='52'%3E%3Cpath d='M15 1.7h30L60 26 45 50.3H15L0 26Z' fill='none' stroke='%23f3ecdc' stroke-opacity='1' stroke-width='1'/%3E%3C/svg%3E");
+  background-size: 60px 52px;
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+}
+
+a { color: inherit; }
+
+/* ---- VIEWS ---- */
+.view {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+  z-index: 1;
+  overflow-y: auto;
+}
+.view.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ---- LANDING ---- */
+.landing-shell {
+  width: min(800px, 100% - 2rem);
+  display: grid;
+  gap: 1.5rem;
+  animation: rise 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.site-header {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-hard-sm);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.9rem 1.25rem;
+}
+
+.brand-mark {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+.brand-mark::before {
+  content: "";
+  width: 11px;
+  height: 12px;
+  background: var(--accent);
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+}
+
+.brand-sub {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.landing-main {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: var(--shadow-hard);
+  padding: clamp(1.5rem, 4vw, 2.75rem);
+  display: grid;
+  gap: 1.6rem;
+  position: relative;
+  overflow: hidden;
+  min-width: 0;
+}
+.landing-main::after {
+  content: "";
+  opacity: 0.18;
+  pointer-events: none;
+  mix-blend-mode: screen;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='94' height='82' viewBox='0 0 94 82'%3E%3Cpath d='M23.5 1h47L93 41 70.5 81h-47L1 41 23.5 1Z' fill='none' stroke='%2339b54a' stroke-opacity='.28'/%3E%3C/svg%3E");
+  background-size: 94px 82px;
+  position: absolute;
+  inset: 0;
+}
+.landing-main > * { position: relative; z-index: 1; }
+
+.kicker {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  font-weight: 500;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+.kicker::before {
+  content: "";
+  width: 8px; height: 9px;
+  background: var(--accent);
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+}
+
+.landing-copy { display: grid; gap: 0.9rem; }
+
+.landing-copy h1 {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "SOFT" 50, "WONK" 0;
+  font-size: clamp(3.2rem, 10vw, 6.5rem);
+  font-weight: 400;
+  line-height: 0.88;
+  letter-spacing: -0.045em;
+  margin: 0;
+}
+.landing-copy h1 em {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "SOFT" 100, "WONK" 1;
+  color: var(--accent);
+  font-weight: 400;
+  display: block;
+}
+
+.landing-text {
+  max-width: 50ch;
+  color: var(--ink-soft);
+  font-size: 1.04rem;
+  line-height: 1.55;
+}
+
+/* ---- FORM ---- */
+.prompt-form {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.input-group {
+  display: flex;
+  border: 1px solid var(--border);
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-hard-sm);
+}
+
+.input-group input {
+  flex: 1;
+  min-height: 3.2rem;
+  padding: 0.8rem 1rem;
+  font-family: var(--body);
+  font-size: 1.05rem;
+  color: var(--ink);
+  background: transparent;
+  border: none;
+  outline: none;
+}
+.input-group input::placeholder { color: var(--muted); }
+
+.random-btn {
+  min-width: 3.2rem;
+  border: none;
+  border-left: 1px solid var(--rule);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 0 0.8rem;
+  transition: background 0.15s, color 0.15s;
+}
+.random-btn:hover { background: var(--accent-dim); color: var(--accent); }
+
+.button {
+  border: 1px solid var(--ink);
+  min-height: 3rem;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  box-shadow: var(--shadow-hard-sm);
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.85rem 1.4rem;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 0.14s, box-shadow 0.14s, background 0.14s, color 0.14s;
+}
+.button:hover, .button:focus-visible {
+  box-shadow: 1px 1px 0 0 var(--paper-deep);
+  transform: translate(2px, 2px);
+}
+
+.button-primary {
+  background: var(--accent);
+  color: #14110c;
+  border-color: var(--ink);
+}
+.button-primary:hover { background: #8ce895; }
+.button-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: var(--shadow-hard-sm);
+}
+
+.hex-icon {
+  font-size: 0.65rem;
+}
+
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.suggestion {
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.35rem 0.65rem;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+.suggestion:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+  box-shadow: var(--shadow-hard-sm);
+  transform: translate(-2px, -2px);
+}
+
+.site-footer {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-hard-sm);
+  padding: 0.7rem 1.25rem;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* ---- LOADING ---- */
+.loading-container {
+  text-align: center;
+  display: grid;
+  gap: 1.2rem;
+  justify-items: center;
+}
+
+.hex-spinner {
+  width: 50px;
+  height: 58px;
+  position: relative;
+}
+.hex-spinner .hex {
+  width: 50px;
+  height: 58px;
+  background: var(--accent);
+  clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+  animation: hex-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes hex-pulse {
+  0%, 100% { transform: rotate(0deg) scale(1); opacity: 1; }
+  50%      { transform: rotate(180deg) scale(0.7); opacity: 0.6; }
+}
+
+.loading-text {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 96, "SOFT" 50, "WONK" 1;
+  font-size: clamp(1.8rem, 5vw, 2.8rem);
+  font-weight: 400;
+  font-style: italic;
+  letter-spacing: -0.03em;
+  color: var(--ink);
+}
+
+.loading-sub {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---- READY ---- */
+.ready-container {
+  text-align: center;
+  max-width: 700px;
+  padding: 2rem;
+  display: grid;
+  gap: 1.2rem;
+  justify-items: center;
+  animation: rise 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.ready-container h1 {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "SOFT" 50, "WONK" 1;
+  font-size: clamp(2.6rem, 7vw, 5rem);
+  font-weight: 400;
+  font-style: italic;
+  letter-spacing: -0.04em;
+  line-height: 0.92;
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+.ready-info {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.ready-hint {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-top: 0.5rem;
+}
+
+/* ---- PRESENTATION ---- */
+.slide-container {
+  position: fixed;
+  inset: 0;
+  background: #000;
+}
+
+.slide-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+}
+.slide-bg.loaded { opacity: 1; }
+
+.slide-gradient {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    to bottom,
+    rgba(0,0,0,0) 0%,
+    rgba(0,0,0,0) 35%,
+    rgba(0,0,0,0.25) 55%,
+    rgba(0,0,0,0.82) 100%
+  );
+}
+
+.slide-content {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: clamp(1.5rem, 4vw, 3rem);
+  padding-bottom: clamp(3rem, 6vw, 5rem);
+}
+
+.slide-title {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "SOFT" 50, "WONK" 0;
+  font-size: clamp(3rem, 8vw, 7rem);
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  line-height: 0.92;
+  color: #fff;
+  text-shadow: 0 2px 30px rgba(0,0,0,0.5), 0 1px 6px rgba(0,0,0,0.3);
+  margin: 0;
+}
+
+.slide-subtitle {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 48, "SOFT" 100, "WONK" 1;
+  font-size: clamp(1.1rem, 3vw, 1.8rem);
+  font-weight: 400;
+  font-style: italic;
+  letter-spacing: -0.01em;
+  color: rgba(255,255,255,0.7);
+  text-shadow: 0 1px 10px rgba(0,0,0,0.4);
+  margin: 0.4rem 0 0;
+}
+
+/* ---- QUOTE OVERLAY ---- */
+.slide-quote-container {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+.slide-quote-container.visible { opacity: 1; }
+
+.slide-quote-inner {
+  text-align: center;
+  max-width: 70%;
+  padding: 2.5rem 3rem;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.12);
+}
+
+.slide-quote-text {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 72, "SOFT" 100, "WONK" 1;
+  font-size: clamp(1.6rem, 4vw, 3rem);
+  font-weight: 400;
+  font-style: italic;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: #fff;
+  text-shadow: 0 2px 16px rgba(0,0,0,0.4);
+  margin: 0;
+  text-wrap: balance;
+}
+.slide-quote-text::before { content: "\\201C"; }
+.slide-quote-text::after  { content: "\\201D"; }
+
+.slide-quote-attr {
+  display: block;
+  font-family: var(--mono);
+  font-size: clamp(0.72rem, 1.4vw, 0.92rem);
+  font-style: normal;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-top: 1rem;
+}
+
+/* Per-person style variations — applied as data-contributor on .slide-quote-inner */
+[data-contributor="collina"] .slide-quote-text { color: #ffd166; }
+[data-contributor="collina"] { border-color: #ffd166; }
+
+[data-contributor="snell"] .slide-quote-text { font-variation-settings: "opsz" 144, "SOFT" 0, "WONK" 0; font-style: normal; font-weight: 600; text-transform: uppercase; font-size: clamp(1.4rem, 3.5vw, 2.6rem); letter-spacing: 0.02em; }
+
+[data-contributor="nizipli"] .slide-quote-text { font-family: var(--mono); font-style: normal; font-size: clamp(1.2rem, 2.8vw, 2rem); letter-spacing: 0.02em; color: #7df9ff; }
+[data-contributor="nizipli"] { border-color: #7df9ff; }
+
+[data-contributor="nagy"] .slide-quote-text { font-variation-settings: "opsz" 9, "SOFT" 100, "WONK" 1; font-size: clamp(2rem, 5vw, 3.6rem); }
+
+[data-contributor="zasso"] .slide-quote-inner { border: 2px solid #ef476f; }
+[data-contributor="zasso"] .slide-quote-text { color: #ef476f; }
+
+[data-contributor="insogna"] .slide-quote-inner { border: 2px dashed var(--accent); background: rgba(0,0,0,0.8); }
+
+[data-contributor="cheung"] .slide-quote-text { font-family: var(--body); font-style: normal; font-weight: 300; font-size: clamp(1.4rem, 3vw, 2.4rem); letter-spacing: 0.04em; }
+
+[data-contributor="borins"] .slide-quote-text { text-transform: uppercase; font-style: normal; font-weight: 500; letter-spacing: 0.06em; font-size: clamp(1.3rem, 3vw, 2.2rem); }
+
+[data-contributor="henningsen"] .slide-quote-inner { background: rgba(106, 217, 117, 0.15); border: 1px solid var(--accent); }
+
+[data-contributor="hamel"] .slide-quote-text { font-variation-settings: "opsz" 48, "SOFT" 100, "WONK" 1; color: #e9c46a; }
+
+[data-contributor="gruenbaum"] .slide-quote-text { font-family: var(--mono); font-style: normal; font-size: clamp(1.1rem, 2.6vw, 1.9rem); color: #a0e7a0; }
+[data-contributor="gruenbaum"] .slide-quote-text::before,
+[data-contributor="gruenbaum"] .slide-quote-text::after { content: ""; }
+[data-contributor="gruenbaum"] .slide-quote-text::before { content: "> "; }
+
+[data-contributor="gonzaga"] .slide-quote-inner { border-left: 4px solid #ff6b6b; border-right: none; border-top: none; border-bottom: none; text-align: left; }
+
+[data-contributor="ippolito"] .slide-quote-text { color: #c8b6ff; }
+[data-contributor="ippolito"] { border-color: #c8b6ff; }
+
+[data-contributor="booth"] .slide-quote-text { font-family: var(--body); font-weight: 700; font-style: normal; font-size: clamp(1.8rem, 4.2vw, 3.2rem); }
+
+[data-contributor="wunder"] .slide-quote-inner { border: 1px solid rgba(255,255,255,0.3); transform: rotate(-1deg); }
+
+[data-contributor="bridgewater"] .slide-quote-text::before,
+[data-contributor="bridgewater"] .slide-quote-text::after { content: ""; }
+[data-contributor="bridgewater"] .slide-quote-text { font-style: normal; text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 6px; }
+
+[data-contributor="cyren"] .slide-quote-text { color: #ff9ff3; }
+[data-contributor="cyren"] .slide-quote-attr { color: #ff9ff3; }
+
+[data-contributor="english"] .slide-quote-inner { background: rgba(0,0,0,0.85); border: none; padding: 3rem 3.5rem; }
+[data-contributor="english"] .slide-quote-text { font-family: var(--body); font-style: normal; font-weight: 200; font-size: clamp(1.6rem, 3.6vw, 2.8rem); letter-spacing: 0.01em; }
+
+[data-contributor="belanger"] .slide-quote-text { font-variation-settings: "opsz" 144, "SOFT" 50, "WONK" 1; font-size: clamp(2rem, 5vw, 3.8rem); font-weight: 300; }
+
+.slide-chrome {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.8rem clamp(1.5rem, 4vw, 3rem);
+}
+
+.slide-counter {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.16em;
+  color: rgba(255,255,255,0.5);
+}
+
+.slide-hints {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.3);
+  transition: opacity 0.3s;
+}
+.slide-container:hover .slide-hints { color: rgba(255,255,255,0.5); }
+
+.slide-notes-overlay {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  max-width: 400px;
+  background: rgba(20, 17, 12, 0.92);
+  border: 1px solid var(--accent-dim);
+  padding: 1rem 1.2rem;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s;
+  z-index: 10;
+}
+.slide-notes-overlay.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.slide-notes-label {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
+
+.slide-notes-text {
+  font-family: var(--body);
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
+/* ---- FIN ---- */
+.fin-container {
+  text-align: center;
+  display: grid;
+  gap: 1.5rem;
+  justify-items: center;
+  animation: rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.fin-container h1 {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 144, "SOFT" 100, "WONK" 1;
+  font-size: clamp(4rem, 12vw, 9rem);
+  font-weight: 400;
+  font-style: italic;
+  letter-spacing: -0.05em;
+  line-height: 0.85;
+  color: var(--accent);
+}
+
+.fin-title {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 48, "SOFT" 50, "WONK" 1;
+  font-size: clamp(1rem, 2.5vw, 1.6rem);
+  font-weight: 400;
+  font-style: italic;
+  color: var(--ink-soft);
+  max-width: 30ch;
+  text-wrap: balance;
+}
+
+/* ---- ERROR ---- */
+.error-container {
+  text-align: center;
+  display: grid;
+  gap: 1.2rem;
+  justify-items: center;
+  max-width: 500px;
+  padding: 2rem;
+}
+
+.error-container h2 {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 96, "SOFT" 50, "WONK" 1;
+  font-size: 3rem;
+  font-weight: 400;
+  font-style: italic;
+  color: var(--ink);
+}
+
+.error-message {
+  color: var(--ink-soft);
+  font-size: 1rem;
+  max-width: 40ch;
+}
+
+/* ---- PROGRESS BAR ---- */
+.slide-progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 3px;
+  background: var(--accent);
+  transition: width 0.4s ease;
+  z-index: 5;
+}
+
+/* ---- RECENT DECKS ---- */
+.recent-section {
+  border-top: 1px solid var(--rule);
+  padding-top: 1rem;
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.recent-list {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.recent-card {
+  border: 1px solid var(--rule);
+  background: var(--surface-elevated);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.7rem 1rem;
+  cursor: pointer;
+  text-decoration: none;
+  color: inherit;
+  min-width: 0;
+  transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+.recent-card:hover {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-hard-sm);
+  transform: translate(-2px, -2px);
+}
+
+.recent-card-title {
+  font-family: var(--display);
+  font-variation-settings: "opsz" 36, "SOFT" 50, "WONK" 1;
+  font-size: 1.05rem;
+  font-weight: 500;
+  font-style: italic;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.recent-card-meta {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ---- SHARE LINK ---- */
+.share-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.4rem;
+}
+
+.share-url {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  max-width: 30ch;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.copy-btn {
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---- MOBILE ---- */
+@media (max-width: 640px) {
+  .landing-shell { width: min(100%, 100% - 1rem); }
+  .landing-main { padding: 1.2rem; }
+  .slide-title { font-size: clamp(2.2rem, 10vw, 3.5rem) !important; }
+  .suggestions { gap: 0.35rem; }
+}
+
+/* ---- TRANSITION ---- */
+.fade-content {
+  transition: opacity 0.35s ease;
+}
+.fade-content.fading {
+  opacity: 0;
+}
+</style>
+</head>
+<body>
+
+<!-- ============ LANDING ============ -->
+<div id="view-landing" class="view active">
+  <div class="landing-shell">
+    <header class="site-header">
+      <span class="brand-mark">Slide Karaoke</span>
+      <span class="brand-sub">NodeConf EU 2026</span>
+    </header>
+
+    <main class="landing-main">
+      <div class="landing-copy">
+        <p class="kicker">Slide Karaoke</p>
+        <h1>Slide<br><em>Karaoke.</em></h1>
+        <p class="landing-text">
+          Enter any topic. Our AI will generate the most absurd
+          presentation imaginable. Then someone has to present it.
+          Live. Without preparation. Good luck.
+        </p>
+      </div>
+
+      <form id="generate-form" class="prompt-form">
+        <div class="input-group">
+          <input
+            type="text"
+            id="prompt-input"
+            placeholder="quarterly earnings report"
+            maxlength="200"
+            autocomplete="off"
+            required
+          >
+          <button type="button" id="random-btn" class="random-btn" title="Random topic">
+            Random
+          </button>
+        </div>
+        <button type="submit" id="submit-btn" class="button button-primary">
+          <span class="hex-icon">&#x25C6;</span> Generate Slides
+        </button>
+      </form>
+
+      <div class="suggestions">
+        <span>Try:</span>
+        <button class="suggestion" type="button">Node.js Performance</button>
+        <button class="suggestion" type="button">Cloud Migration</button>
+        <button class="suggestion" type="button">Team Building</button>
+        <button class="suggestion" type="button">AI Strategy</button>
+        <button class="suggestion" type="button">Budget Review</button>
+      </div>
+
+      <div id="recent-section" class="recent-section" hidden>
+        <p class="kicker">Recent Decks</p>
+        <div id="recent-list" class="recent-list"></div>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      Powered by Cloudflare Workers AI
+    </footer>
+  </div>
+</div>
+
+<!-- ============ LOADING ============ -->
+<div id="view-loading" class="view">
+  <div class="loading-container">
+    <div class="hex-spinner"><div class="hex"></div></div>
+    <p class="loading-text">Generating absurdity...</p>
+    <p class="loading-sub" id="loading-status">Asking the AI for something truly unhinged</p>
+  </div>
+</div>
+
+<!-- ============ READY ============ -->
+<div id="view-ready" class="view">
+  <div class="ready-container">
+    <p class="kicker">Ready to present</p>
+    <h1 id="ready-title"></h1>
+    <p class="ready-info"><span id="ready-count"></span> slides of pure absurdity</p>
+    <div class="share-row" id="share-row">
+      <span class="share-url" id="share-url"></span>
+      <button class="copy-btn" id="copy-btn" type="button">Copy Link</button>
+    </div>
+    <button id="start-btn" class="button button-primary">
+      <span class="hex-icon">&#x25C6;</span> Begin Presentation
+    </button>
+    <p class="ready-hint">Arrow keys to navigate &middot; ESC to exit &middot; N for speaker notes</p>
+  </div>
+</div>
+
+<!-- ============ PRESENTATION ============ -->
+<div id="view-presentation" class="view">
+  <div class="slide-container" id="slide-container">
+    <div class="slide-progress" id="slide-progress"></div>
+    <img class="slide-bg" id="slide-bg" alt="" draggable="false">
+    <div class="slide-gradient"></div>
+    <div class="slide-content fade-content" id="slide-text-content">
+      <h2 class="slide-title" id="slide-title"></h2>
+      <p class="slide-subtitle" id="slide-subtitle"></p>
+    </div>
+    <div class="slide-quote-container fade-content" id="slide-quote-container">
+      <div class="slide-quote-inner" id="slide-quote-inner">
+        <blockquote class="slide-quote-text" id="slide-quote-text"></blockquote>
+        <cite class="slide-quote-attr" id="slide-quote-attr"></cite>
+      </div>
+    </div>
+    <div class="slide-chrome">
+      <span class="slide-counter" id="slide-counter"></span>
+      <span class="slide-hints" id="slide-hints">&#8592; &#8594; navigate &middot; ESC exit &middot; N notes</span>
+    </div>
+    <div class="slide-notes-overlay" id="slide-notes">
+      <p class="slide-notes-label">Speaker Notes</p>
+      <p class="slide-notes-text" id="notes-text"></p>
+    </div>
+  </div>
+</div>
+
+<!-- ============ FIN ============ -->
+<div id="view-fin" class="view">
+  <div class="fin-container">
+    <h1>Fin.</h1>
+    <p class="fin-title" id="fin-title"></p>
+    <button id="new-btn" class="button button-primary">
+      <span class="hex-icon">&#x25C6;</span> New Presentation
+    </button>
+  </div>
+</div>
+
+<!-- ============ ERROR ============ -->
+<div id="view-error" class="view">
+  <div class="error-container">
+    <h2>Oops.</h2>
+    <p class="error-message" id="error-message">Something went wrong generating the presentation.</p>
+    <button id="retry-btn" class="button button-primary">
+      <span class="hex-icon">&#x25C6;</span> Try Again
+    </button>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // ---- State ----
+  var presentation = null;
+  var currentSlide = 0;
+  var notesVisible = false;
+
+  // ---- Random topics ----
+  var TOPICS = [
+    'Quarterly sales report',
+    'Introduction to Node.js',
+    'The future of cloud computing',
+    'Team building workshop',
+    'Budget planning 2027',
+    'Customer satisfaction survey',
+    'DevOps best practices',
+    'Annual company retreat',
+    'Microservices architecture',
+    'Employee onboarding',
+    'Supply chain optimization',
+    'Q4 marketing strategy',
+    'Workplace wellness initiative',
+    'Data center migration',
+    'Cross-functional synergy',
+    'Agile transformation roadmap',
+    'Blockchain for HR',
+    'Leveraging AI in accounting',
+    'Sustainability metrics dashboard',
+    'Digital twin strategy',
+    'Serverless computing overview',
+    'Container orchestration patterns',
+    'Zero-trust security model',
+    'GraphQL vs REST debate',
+    'Technical debt management',
+  ];
+
+  // ---- DOM refs ----
+  var views = {
+    landing:      document.getElementById('view-landing'),
+    loading:      document.getElementById('view-loading'),
+    ready:        document.getElementById('view-ready'),
+    presentation: document.getElementById('view-presentation'),
+    fin:          document.getElementById('view-fin'),
+    error:        document.getElementById('view-error'),
+  };
+
+  var els = {
+    form:           document.getElementById('generate-form'),
+    input:          document.getElementById('prompt-input'),
+    submitBtn:      document.getElementById('submit-btn'),
+    randomBtn:      document.getElementById('random-btn'),
+    loadingStatus:  document.getElementById('loading-status'),
+    readyTitle:     document.getElementById('ready-title'),
+    readyCount:     document.getElementById('ready-count'),
+    shareRow:       document.getElementById('share-row'),
+    shareUrl:       document.getElementById('share-url'),
+    copyBtn:        document.getElementById('copy-btn'),
+    startBtn:       document.getElementById('start-btn'),
+    slideBg:        document.getElementById('slide-bg'),
+    slideTitle:     document.getElementById('slide-title'),
+    slideSubtitle:  document.getElementById('slide-subtitle'),
+    slideQuoteContainer: document.getElementById('slide-quote-container'),
+    slideQuoteInner: document.getElementById('slide-quote-inner'),
+    slideQuoteText: document.getElementById('slide-quote-text'),
+    slideQuoteAttr: document.getElementById('slide-quote-attr'),
+    slideCounter:   document.getElementById('slide-counter'),
+    slideProgress:  document.getElementById('slide-progress'),
+    slideTextContent: document.getElementById('slide-text-content'),
+    slideNotes:     document.getElementById('slide-notes'),
+    notesText:      document.getElementById('notes-text'),
+    finTitle:       document.getElementById('fin-title'),
+    newBtn:         document.getElementById('new-btn'),
+    errorMessage:   document.getElementById('error-message'),
+    retryBtn:       document.getElementById('retry-btn'),
+    recentSection:  document.getElementById('recent-section'),
+    recentList:     document.getElementById('recent-list'),
+  };
+
+  // ---- View management ----
+  function showView(name) {
+    Object.entries(views).forEach(function(entry) {
+      entry[1].classList.toggle('active', entry[0] === name);
+    });
+    // Refresh recent list when returning to landing
+    if (name === 'landing') loadRecent();
+  }
+
+  // ---- Image preloading ----
+  function preloadImages(urls) {
+    return Promise.all(urls.map(function(url) {
+      return new Promise(function(resolve) {
+        var img = new Image();
+        img.onload = resolve;
+        img.onerror = resolve;
+        img.src = url;
+      });
+    }));
+  }
+
+  // ---- Recent decks ----
+  function loadRecent() {
+    fetch('/api/recent').then(function(r) { return r.json(); }).then(function(list) {
+      if (!list || !list.length) {
+        els.recentSection.hidden = true;
+        return;
+      }
+      els.recentSection.hidden = false;
+      els.recentList.innerHTML = list.map(function(entry) {
+        var ago = timeAgo(entry.createdAt);
+        return '<a class="recent-card" href="/p/' + entry.id + '" data-id="' + entry.id + '">'
+          + '<span class="recent-card-title">' + escHtml(entry.title) + '</span>'
+          + '<span class="recent-card-meta">' + escHtml(entry.prompt) + ' &middot; ' + ago + '</span>'
+          + '</a>';
+      }).join('');
+      // Intercept clicks to load in-page
+      els.recentList.querySelectorAll('.recent-card').forEach(function(card) {
+        card.addEventListener('click', function(e) {
+          e.preventDefault();
+          loadDeck(card.getAttribute('data-id'));
+        });
+      });
+    }).catch(function() {});
+  }
+
+  function escHtml(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  function timeAgo(iso) {
+    var diff = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+    return Math.floor(diff / 86400) + 'd ago';
+  }
+
+  // ---- Load a saved deck by id ----
+  async function loadDeck(id) {
+    showView('loading');
+    els.loadingStatus.textContent = 'Loading saved deck...';
+    try {
+      var resp = await fetch('/api/deck/' + encodeURIComponent(id));
+      if (!resp.ok) throw new Error('Deck not found');
+      presentation = await resp.json();
+      currentSlide = 0;
+      notesVisible = false;
+      els.loadingStatus.textContent = 'Loading images...';
+      await preloadImages(presentation.slides.map(function(s) { return s.imageUrl; }));
+      showReadyScreen();
+    } catch (err) {
+      els.errorMessage.textContent = err.message || 'Could not load that deck.';
+      showView('error');
+    }
+  }
+
+  // ---- Show ready screen with share link ----
+  function showReadyScreen() {
+    els.readyTitle.textContent = presentation.title;
+    els.readyCount.textContent = presentation.slides.length;
+    if (presentation.id) {
+      var link = location.origin + '/p/' + presentation.id;
+      els.shareUrl.textContent = link;
+      els.shareRow.style.display = 'flex';
+      // Update URL without reload
+      history.replaceState(null, '', '/p/' + presentation.id);
+    } else {
+      els.shareRow.style.display = 'none';
+    }
+    showView('ready');
+  }
+
+  // ---- Generate presentation ----
+  async function generate(prompt) {
+    showView('loading');
+    els.loadingStatus.textContent = 'Asking the AI for something truly unhinged';
+
+    try {
+      var loadingMessages = [
+        'Consulting the department of absurdity',
+        'Searching for maximally incongruent stock photos',
+        'Calibrating nonsense levels',
+        'Injecting corporate jargon into surrealist manifesto',
+        'Almost there... probably',
+      ];
+      var msgIndex = 0;
+      var msgInterval = setInterval(function() {
+        msgIndex = (msgIndex + 1) % loadingMessages.length;
+        els.loadingStatus.textContent = loadingMessages[msgIndex];
+      }, 3000);
+
+      var resp = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: prompt }),
+      });
+
+      clearInterval(msgInterval);
+
+      if (!resp.ok) {
+        var errData = await resp.json().catch(function() { return {}; });
+        throw new Error(errData.error || 'Generation failed');
+      }
+
+      presentation = await resp.json();
+      currentSlide = 0;
+      notesVisible = false;
+
+      // Preload images
+      els.loadingStatus.textContent = 'Loading images...';
+      await preloadImages(presentation.slides.map(function(s) { return s.imageUrl; }));
+
+      showReadyScreen();
+    } catch (err) {
+      console.error('Generation error:', err);
+      els.errorMessage.textContent = err.message || 'Something went wrong. Please try again.';
+      showView('error');
+    }
+  }
+
+  // ---- Contributor style mapping ----
+  var CONTRIBUTOR_MAP = {
+    'collina': 'collina', 'matteo': 'collina',
+    'snell': 'snell', 'james': 'snell',
+    'nizipli': 'nizipli', 'yagiz': 'nizipli',
+    'zasso': 'zasso',
+    'nagy': 'nagy', 'robert': 'nagy',
+    'insogna': 'insogna', 'paolo': 'insogna',
+    'cheung': 'cheung', 'joyee': 'cheung',
+    'borins': 'borins', 'myles': 'borins',
+    'henningsen': 'henningsen', 'anna': 'henningsen',
+    'hamel': 'hamel', 'antoine': 'hamel',
+    'gruenbaum': 'gruenbaum', 'benjamin': 'gruenbaum',
+    'gonzaga': 'gonzaga', 'rafael': 'gonzaga',
+    'ippolito': 'ippolito', 'marco': 'ippolito',
+    'booth': 'booth', 'geoffrey': 'booth',
+    'wunder': 'wunder', 'claudio': 'wunder',
+    'bridgewater': 'bridgewater', 'ruben': 'bridgewater',
+    'cyren': 'cyren', 'tierney': 'cyren',
+    'english': 'english', 'bryan': 'english',
+    'belanger': 'belanger', 'stephen': 'belanger',
+    'lau': 'lau', 'richard': 'lau',
+    'wu': 'wu', 'chengzhong': 'wu',
+    'adams': 'adams', 'danielle': 'adams',
+    'griggs': 'griggs', 'beth': 'griggs',
+    'adorno': 'adorno', 'ruy': 'adorno',
+    'ihrig': 'ihrig', 'colin': 'ihrig',
+  };
+
+  function getContributorKey(rawQuote) {
+    var lower = rawQuote.toLowerCase();
+    var keys = Object.keys(CONTRIBUTOR_MAP);
+    for (var i = 0; i < keys.length; i++) {
+      if (lower.indexOf(keys[i]) !== -1) return CONTRIBUTOR_MAP[keys[i]];
+    }
+    return '';
+  }
+
+  // ---- Slide rendering ----
+  function renderSlide(index) {
+    if (!presentation || index < 0 || index >= presentation.slides.length) return;
+
+    var slide = presentation.slides[index];
+    currentSlide = index;
+
+    // Fade out text
+    els.slideTextContent.classList.add('fading');
+    els.slideQuoteContainer.classList.remove('visible');
+
+    // Load background
+    var bg = els.slideBg;
+    bg.classList.remove('loaded');
+    var newImg = new Image();
+    newImg.onload = function() {
+      bg.src = slide.imageUrl;
+      requestAnimationFrame(function() { bg.classList.add('loaded'); });
+    };
+    newImg.onerror = function() {
+      bg.src = '';
+      bg.classList.add('loaded');
+    };
+    newImg.src = slide.imageUrl;
+
+    // Update text after brief fade
+    setTimeout(function() {
+      els.slideTitle.textContent = slide.title;
+      els.slideSubtitle.textContent = slide.subtitle || '';
+      els.slideSubtitle.style.display = slide.subtitle ? 'block' : 'none';
+      // Quote handling — split text from attribution, determine contributor style
+      var rawQuote = (slide.quote || '').trim();
+      if (rawQuote) {
+        var dashMatch = rawQuote.match(/^([\s\S]+?)\s*(?:--|—|–)\s*([\s\S]+)$/);
+        if (dashMatch) {
+          els.slideQuoteText.textContent = dashMatch[1].replace(/^["'\u201C]+|["'\u201D]+$/g, '').trim();
+          els.slideQuoteAttr.textContent = '— ' + dashMatch[2].trim();
+        } else {
+          els.slideQuoteText.textContent = rawQuote;
+          els.slideQuoteAttr.textContent = '';
+        }
+        // Determine contributor key for styling
+        var contribKey = getContributorKey(rawQuote);
+        els.slideQuoteInner.setAttribute('data-contributor', contribKey);
+        els.slideQuoteContainer.classList.add('visible');
+      } else {
+        els.slideQuoteContainer.classList.remove('visible');
+      }
+      els.slideCounter.textContent = (index + 1) + ' / ' + presentation.slides.length;
+      els.slideProgress.style.width = ((index + 1) / presentation.slides.length * 100) + '%';
+      els.notesText.textContent = slide.notes || '';
+      els.slideTextContent.classList.remove('fading');
+    }, 200);
+  }
+
+  function nextSlide() {
+    if (!presentation) return;
+    if (currentSlide < presentation.slides.length - 1) {
+      renderSlide(currentSlide + 1);
+    } else {
+      els.finTitle.textContent = presentation.title;
+      showView('fin');
+    }
+  }
+
+  function prevSlide() {
+    if (currentSlide > 0) renderSlide(currentSlide - 1);
+  }
+
+  function startPresentation() {
+    showView('presentation');
+    notesVisible = false;
+    els.slideNotes.classList.remove('visible');
+    renderSlide(0);
+    var container = document.documentElement;
+    if (container.requestFullscreen) {
+      container.requestFullscreen().catch(function() {});
+    }
+  }
+
+  function exitPresentation() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(function() {});
+    }
+    history.replaceState(null, '', '/');
+    showView('landing');
+    presentation = null;
+  }
+
+  function toggleNotes() {
+    notesVisible = !notesVisible;
+    els.slideNotes.classList.toggle('visible', notesVisible);
+  }
+
+  // ---- Event listeners ----
+  els.form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var prompt = els.input.value.trim();
+    if (prompt) {
+      els.submitBtn.disabled = true;
+      generate(prompt).finally(function() { els.submitBtn.disabled = false; });
+    }
+  });
+
+  els.randomBtn.addEventListener('click', function() {
+    // Immediately show a local fallback so the button feels instant
+    els.input.value = TOPICS[Math.floor(Math.random() * TOPICS.length)];
+    els.input.focus();
+    els.randomBtn.disabled = true;
+    els.randomBtn.textContent = '...';
+    // Then try to get a better one from the AI
+    fetch('/api/random-topic').then(function(r) { return r.json(); }).then(function(data) {
+      if (data.topic) {
+        els.input.value = data.topic;
+      }
+    }).catch(function() {}).finally(function() {
+      els.randomBtn.disabled = false;
+      els.randomBtn.textContent = 'Random';
+    });
+  });
+
+  document.querySelectorAll('.suggestion').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      els.input.value = btn.textContent;
+      els.input.focus();
+    });
+  });
+
+  els.startBtn.addEventListener('click', startPresentation);
+
+  els.copyBtn.addEventListener('click', function() {
+    var link = els.shareUrl.textContent;
+    navigator.clipboard.writeText(link).then(function() {
+      els.copyBtn.textContent = 'Copied!';
+      setTimeout(function() { els.copyBtn.textContent = 'Copy Link'; }, 1500);
+    });
+  });
+
+  els.newBtn.addEventListener('click', function() {
+    history.replaceState(null, '', '/');
+    showView('landing');
+  });
+  els.retryBtn.addEventListener('click', function() {
+    history.replaceState(null, '', '/');
+    showView('landing');
+  });
+
+  // Touch navigation for presentation
+  (function() {
+    var touchStartX = 0;
+    var container = document.getElementById('slide-container');
+    container.addEventListener('touchstart', function(e) {
+      touchStartX = e.touches[0].clientX;
+    }, { passive: true });
+    container.addEventListener('touchend', function(e) {
+      var diff = e.changedTouches[0].clientX - touchStartX;
+      if (Math.abs(diff) > 60) {
+        if (diff < 0) nextSlide();
+        else prevSlide();
+      }
+    }, { passive: true });
+    container.addEventListener('click', function(e) {
+      if (e.target.closest('.slide-notes-overlay')) return;
+      var rect = container.getBoundingClientRect();
+      var clickX = e.clientX - rect.left;
+      if (clickX > rect.width * 0.5) nextSlide();
+      else prevSlide();
+    });
+  })();
+
+  // Keyboard navigation
+  document.addEventListener('keydown', function(e) {
+    var activeView = null;
+    Object.entries(views).forEach(function(entry) {
+      if (entry[1].classList.contains('active')) activeView = entry[0];
+    });
+
+    if (activeView === 'presentation') {
+      switch (e.key) {
+        case 'ArrowRight': case ' ': case 'PageDown':
+          e.preventDefault(); nextSlide(); break;
+        case 'ArrowLeft': case 'PageUp':
+          e.preventDefault(); prevSlide(); break;
+        case 'Escape':
+          e.preventDefault(); exitPresentation(); break;
+        case 'n': case 'N':
+          e.preventDefault(); toggleNotes(); break;
+      }
+    } else if (activeView === 'ready') {
+      if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); startPresentation(); }
+      else if (e.key === 'Escape') { e.preventDefault(); history.replaceState(null, '', '/'); showView('landing'); }
+    } else if (activeView === 'fin') {
+      if (e.key === 'Escape' || e.key === ' ' || e.key === 'Enter') { e.preventDefault(); history.replaceState(null, '', '/'); showView('landing'); }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); showView('presentation'); renderSlide(presentation.slides.length - 1); }
+    }
+  });
+
+  // ---- Boot: check for /p/:id deep link, otherwise show landing ----
+  (function boot() {
+    var match = location.pathname.match(/^\\/p\\/([a-z0-9]+)$/);
+    if (match) {
+      loadDeck(match[1]);
+    } else {
+      loadRecent();
+      els.input.focus();
+    }
+  })();
+})();
+</script>
+</body>
+</html>`;
+
+// ================================================================
+// REQUEST HANDLER
+// ================================================================
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Serve the landing page (and saved-deck viewer — same SPA, JS reads the path)
+    if (url.pathname === '/' || url.pathname.startsWith('/p/')) {
+      return new Response(HTML, {
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-cache',
+        },
+      });
+    }
+
+    // API: generate presentation
+    if (url.pathname === '/api/generate' && request.method === 'POST') {
+      try {
+        const body = await request.json() as { prompt?: string };
+        const prompt = body.prompt?.trim();
+
+        if (!prompt) {
+          return Response.json(
+            { error: 'Please provide a topic for your presentation.' },
+            { status: 400 }
+          );
+        }
+
+        if (prompt.length > 200) {
+          return Response.json(
+            { error: 'Topic is too long. Keep it under 200 characters.' },
+            { status: 400 }
+          );
+        }
+
+        const presentation = await generatePresentation(env, prompt);
+
+        // Save to KV and return the stored version (includes id)
+        const stored = await saveDeck(env, prompt, presentation);
+        return Response.json(stored);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        console.error('Generation error:', message);
+        if (error instanceof Error && error.stack) {
+          console.error('Stack:', error.stack);
+        }
+        return Response.json(
+          { error: message || 'Failed to generate presentation. Please try again.' },
+          { status: 500 }
+        );
+      }
+    }
+
+    // API: get a saved presentation by id
+    if (url.pathname.startsWith('/api/deck/') && request.method === 'GET') {
+      const id = url.pathname.slice('/api/deck/'.length);
+      if (!id) return Response.json({ error: 'Missing deck id' }, { status: 400 });
+      const deck = await getDeck(env, id);
+      if (!deck) return Response.json({ error: 'Deck not found' }, { status: 404 });
+      return Response.json(deck);
+    }
+
+    // API: list recent presentations
+    if (url.pathname === '/api/recent' && request.method === 'GET') {
+      const recent = await getRecent(env);
+      return Response.json(recent);
+    }
+
+    // API: generate a random topic via AI
+    if (url.pathname === '/api/random-topic' && request.method === 'GET') {
+      try {
+        // Random category and seed words to steer the model away from repetition
+        const categories = [
+          'corporate strategy meeting', 'engineering all-hands', 'HR workshop',
+          'product launch event', 'investor pitch', 'government committee briefing',
+          'academic conference paper', 'TED-style talk', 'company retreat activity',
+          'board of directors quarterly review', 'internal training session',
+          'industry analyst briefing', 'startup demo day', 'safety compliance seminar',
+          'procurement review', 'municipal planning committee', 'research symposium',
+          'customer advisory board', 'standards body working group', 'trade show panel',
+        ];
+        const flavors = [
+          'about an extremely specific niche topic',
+          'that sounds important but is about something trivial',
+          'that combines two unrelated fields',
+          'that sounds like a self-help book title',
+          'about an everyday object treated with extreme seriousness',
+          'that a middle manager would propose with total confidence',
+          'that sounds like it was auto-generated from buzzwords',
+          'about a mundane process described with military precision',
+          'that nobody asked for but someone approved a budget for',
+          'that sounds like the title of a PhD thesis on something absurd',
+        ];
+        const category = categories[Math.floor(Math.random() * categories.length)];
+        const flavor = flavors[Math.floor(Math.random() * flavors.length)];
+        const seedWords = pickRandom(CHAOS_NOUNS, 2).join(', ');
+
+        const aiResponse = await env.AI.run(
+          '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+          {
+            messages: [
+              {
+                role: 'system',
+                content: `You output a single presentation title, 3-8 words. Nothing else — no quotes, no explanation, no punctuation except what's in the title. Just the title text.`,
+              },
+              {
+                role: 'user',
+                content: `Invent one presentation topic for a ${category} ${flavor}. It should sound plausibly real but be oddly specific or subtly absurd. Inspired by (but not directly using): ${seedWords}. Just the title, nothing else.`,
+              },
+            ],
+            max_tokens: 30,
+            temperature: 1.0,
+          }
+        );
+        const topic = extractAIText(aiResponse)
+          .replace(/^["'*\s]+|["'*\s.]+$/g, '')
+          .replace(/^(Title|Topic|Here|Sure)[:\s]*/i, '')
+          .trim();
+        if (!topic || topic.length < 5) throw new Error('Empty response');
+        return Response.json({ topic });
+      } catch {
+        const fallbacks = [
+          'Quarterly sales report', 'Introduction to Node.js',
+          'Cloud migration strategy', 'Team building workshop',
+          'Budget planning 2027', 'Microservices architecture',
+          'Workplace wellness initiative', 'Data center migration',
+          'Cross-functional synergy framework', 'Container orchestration patterns',
+        ];
+        return Response.json({ topic: fallbacks[Math.floor(Math.random() * fallbacks.length)] });
+      }
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+};
